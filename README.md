@@ -135,6 +135,9 @@ times, tiles and bf16 numbers.
 | int2_via_int2_x_int8_dpas (vs XeTLA's int8 path, incl. activation quantization) | x1.35-3.7 (8B shapes) | x1.2-1.8 (27B, bf16) |
 | bitcos_fp16_upcvt (vs XeTLA BITCOS, z = 0.40, 27B shapes)                       | x1.00-1.09            | -                    |
 
+On the Arc 140V (Lunar Lake) the BITCOS kernel is x1.00-1.25 over XeTLA BITCOS
+on the same 27B shapes.
+
 The BITCOS reference is the paper's own XeTLA harness; see
 [bitcos_fp16_upcvt/](bitcos_fp16_upcvt/) for the per-shape table and the
 paper's zero-density GEMV sweep.

@@ -98,13 +98,12 @@ PACE=15 XB=... bash zsweep.sh results/zsweep_lnl.csv                  # Lunar La
 Bonsai 2 27B decode shapes at one z. Its int2 baselines use the vLLM plugin's
 per-arch int2 config for each shape.
 
-## Results (Arc Pro B70, fp16 activations)
+## Results (fp16 activations)
 
-Speed-up is XeTLA BITCOS time / OpenCL BITCOS time. Lunar Lake is not tuned
-yet: at LS > 1 XeTLA gains from local K slicing there and this kernel does not.
+Speed-up is XeTLA BITCOS time / OpenCL BITCOS time.
 
 **Bonsai 27B / Bonsai 2 27B decode GEMV shapes at z = 0.40** (M = 1, each
-kernel tuned per shape, tile = wg_n:LS):
+kernel tuned per shape, tile = wg_n:LS). Arc Pro B70:
 
 | shape | K x N | XeTLA BITCOS | OpenCL BITCOS | speed-up | int2 XeTLA / TernOCL |
 | --- | --- | --- | --- | --- | --- |
@@ -113,8 +112,24 @@ kernel tuned per shape, tile = wg_n:LS):
 | linear_attn.in_proj_qkvz | 5120 x 16384 | 0.051 ms (32:8) | 0.049 ms (32:4) | x1.05 | 0.048 / 0.046 ms |
 | linear_attn.out_proj | 6144 x 5120 | 0.022 ms (32:4) | 0.021 ms (32:4) | x1.05 | 0.022 / 0.020 ms |
 | self_attn.qkv_proj | 5120 x 14336 | 0.047 ms (64:2) | 0.044 ms (64:2) | x1.07 | 0.042 / 0.041 ms |
+| lm_head | 5120 x 248320 | 0.655 ms (128:4) | 0.609 ms (32:4) | x1.08 | 0.722 / 0.697 ms |
 
-**Paper GEMV sweep** (32768 x 16384; the `--int-apply` scale path, whose B
+Arc 140V (Lunar Lake, `PACE=15`):
+
+| shape | K x N | XeTLA BITCOS | OpenCL BITCOS | speed-up | int2 XeTLA / TernOCL |
+| --- | --- | --- | --- | --- | --- |
+| mlp.gate_up_proj | 5120 x 34816 | 0.559 ms (64:4) | 0.538 ms (32:4) | x1.04 | 0.737 / 0.551 ms |
+| mlp.down_proj | 17408 x 5120 | 0.319 ms (128:1) | 0.254 ms (128:1) | x1.25 | 0.347 / 0.303 ms |
+| linear_attn.in_proj_qkvz | 5120 x 16384 | 0.313 ms (128:4) | 0.264 ms (256:1) | x1.19 | 0.321 / 0.252 ms |
+| linear_attn.out_proj | 6144 x 5120 | 0.115 ms (128:1) | 0.103 ms (128:1) | x1.12 | 0.121 / 0.106 ms |
+| self_attn.qkv_proj | 5120 x 14336 | 0.276 ms (128:4) | 0.239 ms (32:8) | x1.15 | 0.286 / 0.236 ms |
+| lm_head | 5120 x 248320 | 3.516 ms (128:2) | 3.517 ms (32:4) | x1.00 | 4.041 / 3.786 ms |
+
+On Lunar Lake at the paper's larger 32768 x 16384 shape, XeTLA gains from local
+K slicing (LS = 4) while this kernel does not, which is not understood yet; that
+sweep is not reported here.
+
+**Paper GEMV sweep** (Arc Pro B70, 32768 x 16384; the `--int-apply` scale path, whose B
 tile is bit-identical to the default and which is 1-3% slower here):
 
 | z | XeTLA BITCOS | OpenCL BITCOS | speed-up |
