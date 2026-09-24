@@ -1,4 +1,5 @@
 TernOCL
+Copyright (c) 2026, Intel Corporation. BSD 3-Clause License, see LICENSE.md.
 
 The OpenCL kernels in int2_fp16_upcvt/ and int2_via_int2_x_int8_dpas/ are
 ports of Intel XeTLA kernels (int2_fp16_upcvt_xmx_xe.hpp,

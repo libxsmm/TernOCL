@@ -10,9 +10,9 @@ Lake). Each variant is a drop-in, validated replacement for the matching XeTLA
 kernel of the vLLM xetla plugin: same data layouts, same numerics, same fused
 epilogues. Each is benchmarked against that kernel on identical inputs.
 
-| variant | math | activations | XeTLA counterpart |
-| --- | --- | --- | --- |
-| [int2_fp16_upcvt](int2_fp16_upcvt/) | int2 weights upconverted to fp16/bf16, fp16/bf16 DPAS, fp32 acc | fp16 or bf16 | `int2_fp16_upcvt_xmx_xe.hpp` |
+| variant                                                | math                                                                                  | activations  | XeTLA counterpart                                            |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------ |
+| [int2_fp16_upcvt](int2_fp16_upcvt/)                     | int2 weights upconverted to fp16/bf16, fp16/bf16 DPAS, fp32 acc                       | fp16 or bf16 | `int2_fp16_upcvt_xmx_xe.hpp`                               |
 | [int2_via_int2_x_int8_dpas](int2_via_int2_x_int8_dpas/) | activations quantized to int8 (per row and 128-group), native s8 x s2 DPAS, int32 acc | fp16 or bf16 | `int2_fp16_dpas_xmx_xe.hpp`, `int2_bf16_dpas_xmx_xe.hpp` |
 
 Both variants have a decode GEMV (M = 1..8) and a large-M GEMM (prefill), and
@@ -100,13 +100,13 @@ gate_up 5120x34816, down 17408x5120, in_proj_qkvz 5120x16384, out_proj
 The same post-ops as the XeTLA plugin and OpenVINO integration
 (`common/epilogue.clh`) are selected at compile time with `--postop`:
 
-| POSTOP | epilogue |
-| --- | --- |
-| 0 | none |
-| 1 | `silu(acc) * other` (SwiGLU gate) |
-| 2 | `acc + other` (residual) |
-| 3 | `acc + bias[n]` |
-| 4 | `sigmoid(acc)` |
+| POSTOP | epilogue                            |
+| ------ | ----------------------------------- |
+| 0      | none                                |
+| 1      | `silu(acc) * other` (SwiGLU gate) |
+| 2      | `acc + other` (residual)          |
+| 3      | `acc + bias[n]`                   |
+| 4      | `sigmoid(acc)`                    |
 
 `--out-f32` writes fp32 C (and takes an fp32 bias), as for lm_head logits.
 All post-ops work on the fp32 accumulator before the output cast, and sigmoid
@@ -120,31 +120,12 @@ bit-identical for POSTOP 1-4, fp16 and bf16, and M = 1, 77 and 1024.
 Speed-up is XeTLA time / OpenCL time. The per-variant READMEs have per-shape
 times, tiles and bf16 numbers.
 
-| variant | GEMV M = 1 | GEMM M = 1024 |
-| --- | --- | --- |
-| int2_fp16_upcvt | x1.01-1.05 | x4.4-4.9 |
+| variant                                                                         | GEMV M = 1            | GEMM M = 1024        |
+| ------------------------------------------------------------------------------- | --------------------- | -------------------- |
+| int2_fp16_upcvt                                                                 | x1.01-1.05            | x4.4-4.9             |
 | int2_via_int2_x_int8_dpas (vs XeTLA's int8 path, incl. activation quantization) | x1.35-3.7 (8B shapes) | x1.2-1.8 (27B, bf16) |
-
-## Codegen notes for Xe2 OpenCL
-
-These findings apply to XeTLA as well:
-
-* **B loads:** load the packed B tile as 8 single-row 2D block reads, not one
-  8-row read. The first DPAS then waits for 64 B instead of 512 B: 5-9% on
-  decode GEMV, and parity on the smallest (4096x4096) shape.
-* **fp16 accumulator spills:** in the large-M fp16 kernel, IGC folds
-  `convert_half8` into the accumulator chain and spills at MT_M*MT_N >= 2048.
-  An empty `asm volatile("" : "+rw"(v))` before the store stops it.
-* **Divides:** under `-cl-fp32-correctly-rounded-divide-sqrt`, `1/x` becomes an
-  IEEE divide sequence. Use `native_recip` (`math.inv`).
-* **int8 saturation:** `convert_char_sat` costs 5 `sel` per element.
-  `convert_char(clamp(f, -128, 127))` gives one `mov.sat`.
-* **Sigmoid clamp:** IGC miscompiles `x <= -10 ? 0 : s` in the fp16 large-M
-  silu store (all outputs 0). Multiply by `convert_float(x > -10)` instead.
-* **Guarded loads:** guarded per-lane `sub_group_block_read` gets serialized.
-  Use 2D block reads (pitch % 16 B, width >= 64 B).
 
 ## License
 
-See [NOTICE](NOTICE). The XeTLA-derived reference harnesses are Apache-2.0
-([LICENSE.xetla](LICENSE.xetla)).
+BSD 3-Clause, see [LICENSE.md](LICENSE.md). The XeTLA-derived reference
+harnesses are Apache-2.0 ([LICENSE.xetla](LICENSE.xetla)); see [NOTICE](NOTICE).
