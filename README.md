@@ -19,7 +19,7 @@ epilogues. Each is benchmarked against that kernel on identical inputs.
 The int2 variants have a decode GEMV (M = 1..8) and a large-M GEMM (prefill), and
 handle any M (ragged tiles are zero-filled on read and clipped on write).
 They need `N % 16 == 0` and `K % 128 == 0`, with scale group size 128.
-The BITCOS variant is a decode GEMV (M = 1..8) for now.
+The BITCOS variant has a decode GEMV (M = 1..8) and an M-tiled GEMM (prefill, any M).
 
 ## Layout
 

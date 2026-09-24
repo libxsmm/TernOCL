@@ -19,7 +19,7 @@ stores a presence bit per weight and a sign bit per non-zero, so a zero density
 
 This is the layout of `xetla_vllm_plugin.pack_bitcos` (host port in
 [../common/bitcos.hpp](../common/bitcos.hpp)). N must be a multiple of 16 and
-K a multiple of `64 * LS`; M = 1..8 (decode).
+K a multiple of `64 * LS`; the GEMV takes M = 1..8, the M-tiled GEMM any M.
 
 ## Kernel ([bitcos_fp16_upcvt.cl](bitcos_fp16_upcvt.cl))
 
@@ -49,6 +49,20 @@ Per lane (one output column) and 64-row K step, the same messages as XeTLA
 * **Work split:** `SGM` rows per sub-group, `NSG_N` sub-groups along N
   (`--wgn = 16*NSG_N`), `LS` sub-groups splitting K. Slice `s` enters the sign
   stream at `SR[s-1]`, and the slices reduce through SLM.
+
+### `bitcos_fp16_upcvt_gemm_mt` (prefill, any M)
+
+* **Tile:** a sub-group computes an `MT_M x MT_N` tile (`--mt-m`, `--mt-n`);
+  a work-group is `WG_M x WG_N` sub-groups (`--wg-m`, `--wg-n`). Selected with
+  `--mt-m`.
+* **Reuse:** per 64-k step and 16-column block, the two 32-row BITCOS blocks
+  are unpacked once (bitmap read, sign gather, lookups, scale) and the four
+  k16 B operands feed all `MT_M/8` DPAS row blocks. There is no K slicing, so
+  slice ranks are not needed.
+* **Memory:** A and C go through 2D block I/O (zero-filled reads, clipped
+  writes), so ragged M works. 256 GRF.
+* **Registers:** each step holds an `MT_M x 64` A tile, so `MT_M * MT_N >= 2048`
+  (64x32, 128x16) spills.
 
 Inner loop per 64 K rows on BMG (offline `ocloc` ISA):
 
@@ -128,6 +142,12 @@ Arc 140V (Lunar Lake, `PACE=15`):
 On Lunar Lake at the paper's larger 32768 x 16384 shape, XeTLA gains from local
 K slicing (LS = 4) while this kernel does not, which is not understood yet; that
 sweep is not reported here.
+
+**Prefill, M = 1024, z = 0.40** (Arc Pro B70, best of six tiles): 4.96 ms
+(73.7 TFLOPS) on gate_up 5120 x 34816, 2.56 ms (71.2) on down 17408 x 5120,
+1.95 ms (77.0) on qkv 5120 x 14336. This is 1.26-1.29x slower than the
+TernOCL int2 prefill kernel (3.93 / 1.98 / 1.54 ms). XeTLA's BITCOS prefill
+tiles have not been compared yet.
 
 **Paper GEMV sweep** (Arc Pro B70, 32768 x 16384; the `--int-apply` scale path, whose B
 tile is bit-identical to the default and which is 1-3% slower here):

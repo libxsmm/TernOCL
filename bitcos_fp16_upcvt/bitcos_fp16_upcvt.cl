@@ -275,3 +275,94 @@ __kernel void bitcos_fp16_upcvt_gemv(const __global dt *A, const __global uint *
             C[i] = CT_STORE(epi(v, epi_in(Other, Bias, i, n0 + lane)));
         }
 }
+
+// ---------------------------------------------------------------------------
+// M-tiled GEMM for prefill (M > 8) on the same single BITCOS copy. A sub-group
+// computes an MT_M x MT_N tile (MT_M % 8 == 0, MT_N % 16 == 0): per 64-k step
+// and 16-column block it unpacks the two 32-row BITCOS blocks once (bitmap
+// read, sign gather, LUT, scale) and reuses the four k16 B operands for all
+// MT_M/8 DPAS row blocks. A work-group is WG_M x WG_N sub-groups; no K slicing,
+// so SR is unused. A/C through 2D block I/O (zero-fill / clipped), any M.
+#ifndef MT_M
+#define MT_M 32
+#endif
+#ifndef MT_N
+#define MT_N 16
+#endif
+#ifndef WG_M
+#define WG_M 1
+#endif
+#ifndef WG_N
+#define WG_N 4
+#endif
+#define MB (MT_M / 8)
+#define NB (MT_N / 16)
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__attribute__((reqd_work_group_size(16 * WG_N * WG_M, 1, 1)))
+__kernel void bitcos_fp16_upcvt_gemm_mt(const __global dt *A, const __global uint *B,
+        const __global dt *S, const __global uint *SR, __global ct *C, EPI_ARGS,
+        int M, int N, int K) {
+    __local uint2 lut[256];
+    build_lut(lut);
+
+    const int lane = get_sub_group_local_id();
+    const int sg = get_sub_group_id();
+    const int m0 = (get_group_id(1) * WG_M + sg / WG_N) * MT_M;
+    const int n0 = (get_group_id(0) * WG_N + sg % WG_N) * MT_N;
+    const size_t bw = (size_t)(K / 32) * N;
+    const __global uint *signs = B + bw + N;
+
+    uint off[NB], rank[NB];
+    for (int j = 0; j < NB; ++j) {
+        off[j] = n0 + 16 * j < N ? B[bw + n0 + 16 * j + lane] : 0u;
+        rank[j] = 0u;
+    }
+    float8 acc[MB][NB];
+    for (int i = 0; i < MB; ++i)
+        for (int j = 0; j < NB; ++j) acc[i][j] = 0.0f;
+
+    for (int k = 0; k < K; k += STEP) {
+        ushort a[MB][4][8];
+        for (int i = 0; i < MB; ++i)
+            for (int c = 0; c < 4; ++c)
+                intel_sub_group_2d_block_read_16b_8r16x1c((__global void *)A, K * 2, M, K * 2,
+                        (int2)(k + 16 * c, m0 + 8 * i), a[i][c]);
+        for (int j = 0; j < NB; ++j) {
+            if (n0 + 16 * j >= N) continue;  // uniform across the sub-group
+            uint bm[2];
+            intel_sub_group_2d_block_read_32b_2r16x1c((__global void *)B, N * 4, K / 32, N * 4,
+                    (int2)(n0 + 16 * j, k / 32), bm);
+            const uint sc = intel_sub_group_block_read_us(
+                    (const __global ushort *)(S + (size_t)(k / GS) * N + n0 + 16 * j));
+            const uint r0 = rank[j], r1 = r0 + popcount(bm[0]);
+            rank[j] = r1 + popcount(bm[1]);
+            const uint w0 = r0 >> 5;
+            const uint3 q = LOAD_SIGNS(signs + off[j] + w0);
+#ifdef INT_APPLY
+            const uint sx = (sc | 0x8000u) * 0x10001u;
+#elif defined(VISA_HMUL)
+            const uint sx = sc * 0x10001u;
+#else
+            const uint sx = sc;
+#endif
+#pragma unroll
+            for (int ii = 0; ii < 2; ++ii) {
+                int8 b0, b1;
+                unpack_block(lut, bm[ii], sign_window(q, w0, ii ? r1 : r0), sx, &b0, &b1);
+                for (int i = 0; i < MB; ++i) {
+                    acc[i][j] = MAD(as_short8(vload8(0, a[i][2 * ii])), b0, acc[i][j]);
+                    acc[i][j] = MAD(as_short8(vload8(0, a[i][2 * ii + 1])), b1, acc[i][j]);
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < MB; ++i)
+        for (int j = 0; j < NB; ++j) {
+            // barrier: keeps IGC from folding the store conversion into the K loop (spills)
+            float8 v = acc[i][j];
+            __asm__ volatile("" : "+rw"(v));
+            epi_store8x16(C, Other, Bias, M, N, m0 + 8 * i, n0 + 16 * j, v);
+        }
+}

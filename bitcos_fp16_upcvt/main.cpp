@@ -49,6 +49,7 @@ struct RunConfig {
     int num_sets = 0;
     double weights_gib = 2.0;
     int sgm = 0, nsg = 0, ls = 0;  // 0 = default
+    int mt_m = 0, mt_n = 16, wg_m = 1, wg_n = 4;  // mt_m > 0: bitcos_fp16_upcvt_gemm_mt
     std::string cl_path, extra_opts;
     bool print_build_log = false;
     Epilogue epi;
@@ -159,6 +160,9 @@ static void run(RunConfig cfg) {
     std::string opts = std::string("-cl-std=CL3.0") + (dt_is_bf16() ? " -DBF16" : "")
             + (cfg.int_apply ? " -DINT_APPLY" : "") + (cfg.simt_mul ? " -DSIMT_HMUL" : "") + " -DSGM=" + std::to_string(cfg.sgm)
             + " -DNSG_N=" + std::to_string(cfg.nsg) + " -DLS=" + std::to_string(cfg.ls)
+            + (cfg.mt_m ? " -DMT_M=" + std::to_string(cfg.mt_m) + " -DMT_N=" + std::to_string(cfg.mt_n) + " -DWG_M="
+                          + std::to_string(cfg.wg_m) + " -DWG_N=" + std::to_string(cfg.wg_n) + " -cl-intel-256-GRF-per-thread"
+                        : std::string())
             + cfg.epi.opts() + " -I " + cfg.cl_path.substr(0, cfg.cl_path.find_last_of('/') + 1)
             + ". " + cfg.extra_opts;
     err = clBuildProgram(prog, 1, &dev, opts.c_str(), nullptr, nullptr);
@@ -170,7 +174,7 @@ static void run(RunConfig cfg) {
         std::cout << "Build options: " << opts << "\nBuild log:\n" << log << "\n";
         CL_CHECK(err);
     }
-    cl_kernel kern = clCreateKernel(prog, "bitcos_fp16_upcvt_gemv", &err);
+    cl_kernel kern = clCreateKernel(prog, cfg.mt_m ? "bitcos_fp16_upcvt_gemm_mt" : "bitcos_fp16_upcvt_gemv", &err);
     CL_CHECK(err);
 
     const Epilogue &ep = cfg.epi;
@@ -245,8 +249,14 @@ static void run(RunConfig cfg) {
     CL_CHECK(clFinish(q));
 
     const size_t wg_n = 16 * cfg.nsg;
-    const size_t local[2] = {wg_n * cfg.ls, 1};
-    const size_t global[2] = {((N + wg_n - 1) / wg_n) * local[0], (size_t)((M + cfg.sgm - 1) / cfg.sgm)};
+    size_t local[2] = {wg_n * cfg.ls, 1};
+    size_t global[2] = {((N + wg_n - 1) / wg_n) * local[0], (size_t)((M + cfg.sgm - 1) / cfg.sgm)};
+    if (cfg.mt_m) {
+        const size_t tn = (size_t)cfg.mt_n * cfg.wg_n, tm = (size_t)cfg.mt_m * cfg.wg_m;
+        local[0] = 16 * (size_t)cfg.wg_n * cfg.wg_m;
+        global[0] = ((N + tn - 1) / tn) * local[0];
+        global[1] = (M + tm - 1) / tm;
+    }
 
     double dev_ns = 0.0, host_ms = 0.0, bsum = 0.0;
     int timed = 0;
@@ -351,6 +361,10 @@ int main(int argc, char **argv) {
         else if (a == "--nsg" && i + 1 < argc) cfg.nsg = ival(i);
         else if (a == "--wgn" && i + 1 < argc) cfg.nsg = ival(i) / 16;
         else if (a == "--ls" && i + 1 < argc) cfg.ls = ival(i);
+        else if (a == "--mt-m" && i + 1 < argc) cfg.mt_m = ival(i);
+        else if (a == "--mt-n" && i + 1 < argc) cfg.mt_n = ival(i);
+        else if (a == "--wg-m" && i + 1 < argc) cfg.wg_m = ival(i);
+        else if (a == "--wg-n" && i + 1 < argc) cfg.wg_n = ival(i);
         else if (a == "--cl" && i + 1 < argc) cfg.cl_path = argv[++i];
         else if (a == "--opts" && i + 1 < argc) cfg.extra_opts = argv[++i];
         else if (a == "--postop" && i + 1 < argc) {
