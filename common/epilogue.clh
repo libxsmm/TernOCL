@@ -1,0 +1,87 @@
+// Fused epilogues on the fp32 accumulator, numbered like the xetla vLLM plugin
+// and OpenVINO integration (csrc/int2_fp16_upcvt_kernel.sycl, xetla_int2_gemv.cpp):
+//   POSTOP 0 none, 1 silu(acc) * other (SwiGLU gate), 2 acc + other (residual),
+//          3 acc + bias[n], 4 sigmoid(acc)   (GatedDeltaNet in_proj_a / in_proj_b)
+//   OUT_F32: C (and bias) in fp32 instead of DT (lm_head logits)
+// other: DT [M, N] (same layout as C). sigmoid = 1 / (exp(-x) + 1) as xetla_sigmoid.
+// Needs dt, TOF, TOF8, TO_DT, TO_DT8 from the including kernel.
+#ifndef POSTOP
+#define POSTOP 0
+#endif
+#ifdef OUT_F32
+typedef float ct;
+#define CT_TOF(x) (x)
+#define CT_STORE(x) (x)
+#else
+typedef dt ct;
+#define CT_TOF(x) TOF(x)
+#define CT_STORE(x) TO_DT(x)
+#endif
+#define EPI_ARGS const __global dt *Other, const __global ct *Bias
+
+// xetla_sigmoid: 0 for x <= -10, else 1 / (exp(-x) + 1); native_recip keeps math.inv
+// under -cl-fp32-correctly-rounded-divide-sqrt (int8 build). The clamp is a multiply:
+// IGC miscompiles the ?: form in the fp16 large-M silu store (all outputs 0).
+inline float sigmoid_x(float x) { return native_recip(native_exp(-x) + 1.0f) * convert_float(x > -10.0f); }
+
+inline float epi(float v, float e) {
+#if POSTOP == 1
+    return v * sigmoid_x(v) * e;
+#elif POSTOP == 2 || POSTOP == 3
+    return v + e;
+#elif POSTOP == 4
+    return sigmoid_x(v);
+#else
+    return v;
+#endif
+}
+
+// epilogue operand of element i = m * N + n (scalar store paths)
+inline float epi_in(EPI_ARGS, size_t i, int n) {
+#if POSTOP == 1 || POSTOP == 2
+    return TOF(Other[i]);
+#elif POSTOP == 3
+    return CT_TOF(Bias[n]);
+#else
+    return 0.0f;
+#endif
+}
+
+// Epilogue + 2D block store of one 8 x 16 tile at (m0, n0); out of range rows
+// and columns are zero-filled on read and clipped on write.
+inline void epi_store8x16(__global ct *C, EPI_ARGS, int M, int N, int m0, int n0, float8 v) {
+#if POSTOP == 1 || POSTOP == 2
+    ushort t[8];
+    intel_sub_group_2d_block_read_16b_8r16x1c((__global void *)Other, N * 2, M, N * 2,
+            (int2)(n0, m0), t);
+    const float8 e = TOF8(vload8(0, t));
+#elif POSTOP == 3
+#ifdef OUT_F32
+    uint t;
+    intel_sub_group_2d_block_read_32b_1r16x1c((__global void *)Bias, N * 4, 1, N * 4,
+            (int2)(n0, 0), &t);
+    const float8 e = (float8)(as_float(t));
+#else
+    ushort t;
+    intel_sub_group_2d_block_read_16b_1r16x1c((__global void *)Bias, N * 2, 1, N * 2,
+            (int2)(n0, 0), &t);
+    const float8 e = (float8)(TOF(t));
+#endif
+#else
+    const float8 e = 0.0f;
+#endif
+#if POSTOP != 0
+    for (int r = 0; r < 8; ++r) v[r] = epi(v[r], e[r]);
+#endif
+#ifdef OUT_F32
+    uint o[8];
+    vstore8(as_uint8(v), 0, o);
+    intel_sub_group_2d_block_write_32b_8r16x1c((__global void *)C, N * 4, M, N * 4,
+            (int2)(n0, m0), o);
+#else
+    ushort o[8];
+    vstore8(TO_DT8(v), 0, o);
+    intel_sub_group_2d_block_write_16b_8r16x1c((__global void *)C, N * 2, M, N * 2,
+            (int2)(n0, m0), o);
+#endif
+}

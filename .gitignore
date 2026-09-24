@@ -1,0 +1,9 @@
+build/
+build_*/
+*.o
+results/
+*.log
+*.sweep
+*.txt
+slurm-*.out
+.buildlogs/

@@ -1,0 +1,14 @@
+TernOCL
+
+The OpenCL kernels in int2_fp16_upcvt/ and int2_via_int2_x_int8_dpas/ are
+ports of Intel XeTLA kernels (int2_fp16_upcvt_xmx_xe.hpp,
+int2_fp16_dpas_xmx_xe.hpp, int2_bf16_dpas_xmx_xe.hpp) and follow their data
+layouts, dequantization and quantization schemes.
+
+The xetla_ref/ and xetla_ref_bf16/ harnesses are derived from the XeTLA test
+drivers (int2_fp16_upcvt_dpas_fast_test, int2_fp16_dpas_fp16scales_fast_test,
+int2_bf16_dpas_fast_test) and are licensed under the Apache License 2.0; see
+LICENSE.xetla.
+
+tools/xetla_epilogue_parity/ compiles against the vLLM xetla plugin's
+csrc/int2_fp16_upcvt_kernel.sycl (not redistributed here).
