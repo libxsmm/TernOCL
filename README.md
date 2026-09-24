@@ -14,21 +14,26 @@ epilogues. Each is benchmarked against that kernel on identical inputs.
 | ------------------------------------------------------ | ------------------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------ |
 | [int2_fp16_upcvt](int2_fp16_upcvt/)                     | int2 weights upconverted to fp16/bf16, fp16/bf16 DPAS, fp32 acc                       | fp16 or bf16 | `int2_fp16_upcvt_xmx_xe.hpp`                               |
 | [int2_via_int2_x_int8_dpas](int2_via_int2_x_int8_dpas/) | activations quantized to int8 (per row and 128-group), native s8 x s2 DPAS, int32 acc | fp16 or bf16 | `int2_fp16_dpas_xmx_xe.hpp`, `int2_bf16_dpas_xmx_xe.hpp` |
+| [bitcos_fp16_upcvt](bitcos_fp16_upcvt/)                 | BITCOS weights (presence bitmap + compacted signs, 2 - z bits/weight) unpacked through an SLM table, fp16/bf16 DPAS, fp32 acc | fp16 or bf16 | `bitcos_fp16_upcvt_xmx_xe.hpp` |
 
-Both variants have a decode GEMV (M = 1..8) and a large-M GEMM (prefill), and
+The int2 variants have a decode GEMV (M = 1..8) and a large-M GEMM (prefill), and
 handle any M (ragged tiles are zero-filled on read and clipped on write).
 They need `N % 16 == 0` and `K % 128 == 0`, with scale group size 128.
+The BITCOS variant is a decode GEMV (M = 1..8) for now.
 
 ## Layout
 
 ```
-common/            dt16.hpp (fp16/bf16 host helpers), epilogue.clh / epilogue.hpp (fused post-ops)
+common/            dt16.hpp (fp16/bf16 host helpers), epilogue.clh / epilogue.hpp (fused post-ops),
+                   bitcos.hpp (BITCOS packer, slice ranks, decoder)
 hadamard/          hadamard_fwht.cl: fused sign flip + blockwise 1024 Walsh-Hadamard input
                    transform for rotated-basis checkpoints (Bonsai 2), fp16 or bf16
 int2_fp16_upcvt/   kernel, driver, Makefile, validate.sh, bench.sh, sweep_midm.sh (prompt-length M),
                    sweep_mt.sh (M >= 64), xetla_ref/ (XeTLA harness)
 int2_via_int2_x_int8_dpas/
                    kernel, driver, Makefile, validate.sh, bench.sh, xetla_ref/ + xetla_ref_bf16/
+bitcos_fp16_upcvt/ kernel, driver, Makefile, validate.sh, zsweep.sh (paper GEMV z sweep),
+                   shapes27b.sh (Bonsai 27B shapes at one z)
 tools/             xetla_epilogue_parity/ (bit-exact epilogue check and same-runtime GEMV bench
                    against the plugin's own kernel), tune_8b_small.sh
 run_all.sh         validate / epilogues / bench for every variant, dtype and M
@@ -50,6 +55,7 @@ source /swtools/intel/2026.0/oneapi-vars.sh --force
 
 make -C int2_fp16_upcvt CXX=g++
 make -C int2_via_int2_x_int8_dpas CXX=g++
+make -C bitcos_fp16_upcvt CXX=g++
 
 # XeTLA references (needs the xetla tree of the vLLM plugin)
 export XETLA=/path/to/xetla_vllm_plugin/xetla
@@ -127,6 +133,11 @@ times, tiles and bf16 numbers.
 | ------------------------------------------------------------------------------- | --------------------- | -------------------- |
 | int2_fp16_upcvt                                                                 | x1.01-1.05            | x4.4-4.9             |
 | int2_via_int2_x_int8_dpas (vs XeTLA's int8 path, incl. activation quantization) | x1.35-3.7 (8B shapes) | x1.2-1.8 (27B, bf16) |
+| bitcos_fp16_upcvt (vs XeTLA BITCOS, z = 0.40, 27B shapes)                       | x1.00-1.09            | -                    |
+
+The BITCOS reference is the paper's own XeTLA harness; see
+[bitcos_fp16_upcvt/](bitcos_fp16_upcvt/) for the per-shape table and the
+paper's zero-density GEMV sweep.
 
 ## License
 

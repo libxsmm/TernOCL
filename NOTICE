@@ -13,3 +13,7 @@ LICENSE.xetla.
 
 tools/xetla_epilogue_parity/ compiles against the vLLM xetla plugin's
 csrc/int2_fp16_upcvt_kernel.sycl (not redistributed here).
+
+bitcos_fp16_upcvt/ ports the XeTLA BITCOS kernel (bitcos_fp16_upcvt_xmx_xe.hpp)
+and follows its layout and unpack sequence. It is benchmarked against the XeTLA
+harness bitcos_fp16_dpas_fp16scales_fast_test (not redistributed here).
