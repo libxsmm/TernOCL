@@ -23,7 +23,10 @@ They need `N % 16 == 0` and `K % 128 == 0`, with scale group size 128.
 
 ```
 common/            dt16.hpp (fp16/bf16 host helpers), epilogue.clh / epilogue.hpp (fused post-ops)
-int2_fp16_upcvt/   kernel, driver, Makefile, validate.sh, bench.sh, xetla_ref/ (XeTLA harness)
+hadamard/          hadamard_fwht.cl: fused sign flip + blockwise 1024 Walsh-Hadamard input
+                   transform for rotated-basis checkpoints (Bonsai 2), fp16 or bf16
+int2_fp16_upcvt/   kernel, driver, Makefile, validate.sh, bench.sh, sweep_midm.sh (prompt-length M),
+                   sweep_mt.sh (M >= 64), xetla_ref/ (XeTLA harness)
 int2_via_int2_x_int8_dpas/
                    kernel, driver, Makefile, validate.sh, bench.sh, xetla_ref/ + xetla_ref_bf16/
 tools/             xetla_epilogue_parity/ (bit-exact epilogue check and same-runtime GEMV bench
