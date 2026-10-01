@@ -104,12 +104,15 @@ Prefill, M = 1024:
 
 | shape | tile (mt, wg) | `--shl` (ms) | `sel` (ms) | `sel` TFLOPS | sel vs shl | vs int2 |
 | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 64x32, 4x4 | 2.834 | 2.795 | 130.6 | +1.4% | x1.14 |
-| down | 32x32, 1x8 | 1.359 | 1.343 | 135.9 | +1.2% | x1.25 |
-| in_proj_qkvz | 32x32, 2x2 | 1.291 | 1.255 | 136.9 | +2.9% | x1.13 |
-| out_proj | 32x32, 1x8 | 0.491 | 0.486 | 132.4 | +1.0% | x1.18 |
-| qkv | 32x32, 2x2 | 1.110 | 1.102 | 136.4 | +0.7% | x1.11 |
-| lm_head | 64x32, 4x2 | 21.37 | 20.92 | 124.5 | +2.1% | x1.13 |
+| gate_up | 64x32, 4x4 | 2.834 | 2.795 | 130.6 | +1.4% | x0.95 |
+| down | 32x32, 1x8 | 1.359 | 1.343 | 135.9 | +1.2% | x1.03 |
+| in_proj_qkvz | 32x32, 2x2 | 1.291 | 1.255 | 136.9 | +2.9% | x0.99 |
+| out_proj | 32x32, 1x8 | 0.491 | 0.486 | 132.4 | +1.0% | x1.00 |
+| qkv | 32x32, 2x2 | 1.110 | 1.102 | 136.4 | +0.7% | x0.97 |
+| lm_head | 64x32, 4x2 | 21.37 | 20.92 | 124.5 | +2.1% | x0.97 |
+
+At M = 1024 int1 and int2 are on par: both are DPAS-bound with the same
+A-load scheme, and the select decode is a small part of the loop either way.
 
 With the dequantization replaced by a single `xor` (not a valid kernel, a
 ceiling), the same M-tiled loop reaches about 148 TFLOPS on qkv.

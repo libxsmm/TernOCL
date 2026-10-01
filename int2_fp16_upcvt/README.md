@@ -69,7 +69,7 @@ no SLM, and the same for bf16 (sign = bit 15).
   `AK` = 32: one 2 KiB `16b_32r16x2c` message feeds two K16 DPAS steps of 32
   rows; `AK` = 16 for `MT_M > 64`, whose 32-K A tile would spill). Against
   one `8r16x1c` read per 8 rows per K16 this cuts the A messages 8x and gives
-  +12-19% at M = 1024 on the best tiles (`-DAR=8|16|32`, `-DAK=16|32`).
+  +11-21% at M = 1024 (best tiles, all 11 shapes; `-DAR=8|16|32`, `-DAK=16|32`).
 * **Registers:** 256 GRF by default (`--grf128` for 128).
 * **fp16 spill fix:** an empty `asm volatile` on each accumulator before the
   store stops IGC from folding the fp16 conversion into the K loop, which
@@ -137,21 +137,23 @@ same kernel reads at up to 556 GiB/s, so the large shapes are now at the
 DRAM limit.
 
 Prefill, M = 1024. XeTLA runs the plugin's M-tiled prefill kernel
-(`--mtile 1`); OpenCL uses the best `gemm_mt` tile per shape.
+(`--mtile 1`); OpenCL uses the best `gemm_mt` tile per shape. "before" =
+the previously published OpenCL times (integer decode, 8-row x 16-K A reads).
 
-| shape | XeTLA (ms) | OpenCL (ms) | OpenCL TFLOPS | speed-up | before (ms) |
-| --- | --- | --- | --- | --- | --- |
-| 8B qkv | 2.200 | 0.421 | 122 | x5.22 | 0.460 |
-| 8B o_proj | 1.475 | 0.294 | 117 | x5.02 | 0.322 |
-| 8B gate_up | 9.059 | 1.739 | 119 | x5.21 | 1.911 |
-| 8B down | 4.396 | 0.835 | 124 | x5.27 | 0.917 |
-| 8B lm_head | 57.42 | 11.34 | 112 | x5.06 | 12.48 |
-| 27B gate_up | 16.39 | 3.173 | 115 | x5.17 | 3.475 |
-| 27B down | 7.915 | 1.673 | 109 | x4.73 | 1.833 |
-| 27B in_proj_qkvz | 7.496 | 1.415 | 121 | x5.30 | 1.553 |
-| 27B out_proj | 2.745 | 0.574 | 112 | x4.78 | 0.634 |
-| 27B qkv | 6.455 | 1.220 | 123 | x5.29 | 1.338 |
-| 27B lm_head | 118.6 | 23.56 | 111 | x5.03 | 25.71 |
+| shape | XeTLA (ms) | OpenCL (ms) | OpenCL TFLOPS | tile (mt, wg) | speed-up | before (ms) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8B qkv | 2.196 | 0.377 | 137 | 64x32, 4x4 | x5.83 | 0.460 |
+| 8B o_proj | 1.476 | 0.264 | 130 | 64x16, 2x4 | x5.59 | 0.322 |
+| 8B gate_up | 9.059 | 1.488 | 139 | 64x16, 2x2 | x6.09 | 1.911 |
+| 8B down | 4.389 | 0.733 | 141 | 64x32, 4x2 | x5.99 | 0.917 |
+| 8B lm_head | 57.41 | 9.720 | 131 | 64x32, 4x4 | x5.91 | 12.48 |
+| 27B gate_up | 16.40 | 2.650 | 138 | 64x32, 4x4 | x6.19 | 3.475 |
+| 27B down | 7.923 | 1.388 | 132 | 32x32, 1x8 | x5.71 | 1.833 |
+| 27B in_proj_qkvz | 7.487 | 1.244 | 138 | 64x16, 2x2 | x6.02 | 1.553 |
+| 27B out_proj | 2.743 | 0.485 | 133 | 64x16, 1x8 | x5.65 | 0.634 |
+| 27B qkv | 6.442 | 1.070 | 141 | 64x32, 4x4 | x6.02 | 1.338 |
+| 27B lm_head | 118.7 | 20.30 | 128 | 64x32, 4x4 | x5.85 | 25.71 |
 
-bf16 (27B shapes, B70): GEMV x1.20-1.29 (455-555 GiB/s), GEMM x4.74-5.33
-(111-125 TFLOPS); with the integer decode it was x1.01-1.07 and x4.35-4.88.
+bf16 (27B shapes, B70): GEMV x1.20-1.29 (455-555 GiB/s), GEMM x5.70-6.17
+(131-141 TFLOPS); with the integer decode and 8-row A reads it was
+x1.01-1.07 and x4.35-4.88.

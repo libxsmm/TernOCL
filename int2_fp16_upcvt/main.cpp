@@ -56,7 +56,7 @@ struct RunConfig {
     // large-M kernel (int2_fp16_upcvt_gemm_mt): sub-group tile mt_m x mt_n,
     // work-group wg_m x wg_n sub-groups; used when mt_m > 0 or M >= 64.
     // Default = most common best on the B70 at M = 1024 (bench.sh, select decode).
-    int mt_m = 0, mt_n = 32, wg_m = 4, wg_n = 2;
+    int mt_m = 0, mt_n = 32, wg_m = 4, wg_n = 4;
     bool grf256 = true;
     bool int_dq = false;  // xetla's integer-op decode instead of predicated selects
     std::string cl_path;

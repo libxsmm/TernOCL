@@ -137,7 +137,7 @@ times, tiles and bf16 numbers.
 
 | variant                                                                         | GEMV M = 1            | GEMM M = 1024        |
 | ------------------------------------------------------------------------------- | --------------------- | -------------------- |
-| int2_fp16_upcvt                                                                 | x1.14-1.28            | x4.7-5.3             |
+| int2_fp16_upcvt                                                                 | x1.14-1.28            | x5.6-6.2             |
 | int2_via_int2_x_int8_dpas (vs XeTLA's int8 path, incl. activation quantization) | x1.35-3.7 (8B shapes) | x1.2-1.8 (27B, bf16) |
 | bitcos_fp16_upcvt (vs XeTLA BITCOS, z = 0.40, 27B shapes)                       | x1.00-1.09            | -                    |
 
@@ -146,7 +146,7 @@ on the same 27B shapes.
 
 int1_fp16_upcvt on the 27B shapes (no XeTLA kernel): GEMV M = 1 at 404-553
 GiB/s (up to 98% of the 608 GB/s peak), x1.67-1.92 over int2_fp16_upcvt;
-GEMM M = 1024 at 124-137 TFLOPS, x1.11-1.25.
+GEMM M = 1024 at 124-137 TFLOPS, on par with int2_fp16_upcvt (x0.95-1.03).
 
 Both upcvt variants build the DPAS B operand with predicated selects in
 inline vISA (see [docs/xe2_codegen_notes.md](docs/xe2_codegen_notes.md));

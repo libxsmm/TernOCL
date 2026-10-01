@@ -16,6 +16,12 @@ Findings from porting the XeTLA int2 kernels. They apply to XeTLA as well.
   silu store (all outputs 0). Multiply by `convert_float(x > -10)` instead.
 * **Guarded loads:** guarded per-lane `sub_group_block_read` gets serialized.
   Use 2D block reads (pitch % 16 B, width >= 64 B).
+* **A loads in the M-tiled GEMM:** read A as 32-row x 32-K 2D blocks
+  (`16b_32r16x2c`, 2 KiB); the GRF layout is the DPAS A operand as is, and
+  one message feeds 4 row blocks x 2 K16 steps. Against one `8r16x1c` per 8
+  rows per K16: 8x fewer messages, +11-21% at M = 1024. For sub-group tiles
+  taller than 64 rows, a 32-K A tile next to the accumulators exceeds 256 GRF
+  and spills catastrophically (~100x slower); use 16-K reads there.
 * **Low-bit decode = predicated selects:** a VNNI2 DPAS B register, read as a
   SIMD32 16-bit operand, is channel j = (column j/2, row 2c + (j & 1)).
   Building it with `(P) sel (32) :uw -s2, +s2` (plus `(~Pz) mov 0` for ternary)
