@@ -1,11 +1,11 @@
 #!/bin/bash
-# Validate the fused epilogues of both variants against the host fp32 gold:
+# Validate the fused epilogues of every variant against the host fp32 gold:
 # POSTOP 0..4 (none, silu(acc)*other, acc+other, acc+bias, sigmoid) with DT and
 # fp32 outputs, fp16 + bf16, GEMV (M=1, ragged M=3) and large-M (ragged M=77).
 #   BUILD=build bash validate_epilogues.sh [variant ...]
 R=$(cd "$(dirname "$0")" && pwd)
 BUILD=${BUILD:-build}
-VARIANTS=${*:-int2_fp16_upcvt int2_via_int2_x_int8_dpas}
+VARIANTS=${*:-int2_fp16_upcvt int2_via_int2_x_int8_dpas int1_fp16_upcvt}
 pass=0; fail=0
 run() {  # label, command...
     local label=$1; shift
