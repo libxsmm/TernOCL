@@ -10,10 +10,17 @@
 //   C : DT [M, N]
 //
 // DT is fp16, or bf16 with -DBF16 (xetla's XT template parameter).
-// Codes are {0, 1, 3} = {0, +1, -1}. As in xetla, the scale is folded into
-// the upconvert with integer ops only -- (scale ^ sign) & magnitude -- so the
-// B tile comes out in whichever 16-bit float DT is and goes straight into
-// the DT DPAS, fp32 accumulate.
+// Codes are {0, 1, 3} = {0, +1, -1}. Each DPAS B register is built from the
+// codes by predicated selects (inline vISA, same weight layout as xetla):
+// register c, read as 32 16-bit channels, is channel j = (column j/2, row
+// 2c + (j & 1)); a SIMD32 and.nz on lane j/2's half-word (region <2;2,0>)
+// against alternating bit masks (<0;2,1>) gives the sign and nonzero
+// predicates of all 32 channels, then
+//   (Psign) sel B[c] -s2, +s2;  (~Pnz) mov B[c] 0
+// with the scale pairs hoisted per 128-group: 4 instructions per register.
+// -DINT_DQ keeps xetla's integer-op upconvert, (scale ^ sign) & magnitude.
+// Either way the B tile comes out in DT and goes straight into the DT DPAS,
+// fp32 accumulate.
 //
 // Work decomposition (compile-time via -D):
 //   SGM    rows per sub-group (DPAS repeat count: 1, 2, 4, 8)
@@ -81,6 +88,7 @@ typedef float8 acc_t;
 #error "SGM must be 1, 2, 4 or 8"
 #endif
 
+#ifdef INT_DQ
 // Two consecutive K codes (one nibble of the word, low bits of x) -> one VNNI
 // dword holding the two DT weights, each 0, +scale or -scale (sign = bit 15).
 inline int dq_pair(uint x, uint s2) {
@@ -102,6 +110,41 @@ inline int8 dq_word(uint w, uint s2) {
     b.s7 = dq_pair(w >> 28, s2);
     return b;
 }
+#else
+// Register c: half-word h = c / 4 of each lane's word; MK uw elements
+// mz, mz+1 / ms, ms+1 = nonzero / sign bit of rows 2c, 2c+1 in that half.
+// IGC folds each and + cmp.ne into one and.nz writing a flag.
+#define I2_ROW(c, h, mz, ms) \
+    "and (M1_NM, 32) T(0,0)<1> WH(0," #h ")<2;2,0> MK(0," #mz ")<0;2,1>\n" \
+    "cmp.ne (M1_NM, 32) PZ" #c " T(0,0)<1;1,0> 0x0:uw\n" \
+    "and (M1_NM, 32) T(0,0)<1> WH(0," #h ")<2;2,0> MK(0," #ms ")<0;2,1>\n" \
+    "cmp.ne (M1_NM, 32) PS" #c " T(0,0)<1;1,0> 0x0:uw\n" \
+    "(PS" #c ") sel (M1_NM, 32) BW(" #c ",0)<1> NW(0,0)<1;1,0> PW(0,0)<1;1,0>\n" \
+    "(PZ" #c ") sel (M1_NM, 32) BW(" #c ",0)<1> BW(" #c ",0)<1;1,0> 0x0:uw\n"
+#define I2_PDECL(c) ".decl PZ" #c " v_type=P num_elts=32\n.decl PS" #c " v_type=P num_elts=32\n"
+
+inline int8 dq_word(uint w, uint s2) {
+    const uint n2 = s2 ^ 0x80008000u;
+    // lane k < 4: nonzero bits 4k, 4k+2 (rows 2k, 2k+1 of a half); 4 <= k < 8: sign bits
+    const uint l = get_sub_group_local_id() & 7;
+    const uint b = 4 * (l & 3) + (l >> 2);
+    const uint mk = (1u << b) | (1u << (b + 2)) << 16;
+    int8 r;
+    __asm__("{\n"
+        ".decl WH v_type=G type=uw num_elts=32 align=GRF alias=<%1,0>\n"
+        ".decl PW v_type=G type=uw num_elts=32 align=GRF alias=<%2,0>\n"
+        ".decl NW v_type=G type=uw num_elts=32 align=GRF alias=<%3,0>\n"
+        ".decl MK v_type=G type=uw num_elts=32 align=GRF alias=<%4,0>\n"
+        ".decl BW v_type=G type=uw num_elts=256 align=GRF alias=<%0,0>\n"
+        ".decl T v_type=G type=uw num_elts=32 align=GRF\n"
+        I2_PDECL(0) I2_PDECL(1) I2_PDECL(2) I2_PDECL(3)
+        I2_PDECL(4) I2_PDECL(5) I2_PDECL(6) I2_PDECL(7)
+        I2_ROW(0, 0, 0, 8) I2_ROW(1, 0, 2, 10) I2_ROW(2, 0, 4, 12) I2_ROW(3, 0, 6, 14)
+        I2_ROW(4, 1, 0, 8) I2_ROW(5, 1, 2, 10) I2_ROW(6, 1, 4, 12) I2_ROW(7, 1, 6, 14)
+        "}\n" : "=rw"(r) : "rw"(w), "rw"(s2), "rw"(n2), "rw"(mk));
+    return r;
+}
+#endif
 
 inline void load_b(const __global uint *B, int N, int K, int n0, int s,
         __private uint *w) {

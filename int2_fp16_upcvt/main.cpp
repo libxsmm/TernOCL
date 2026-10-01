@@ -55,9 +55,10 @@ struct RunConfig {
     int sgm = 0, nsg = 0, ls = 0, u = 0, pf = 0;  // 0 = default dispatch
     // large-M kernel (int2_fp16_upcvt_gemm_mt): sub-group tile mt_m x mt_n,
     // work-group wg_m x wg_n sub-groups; used when mt_m > 0 or M >= 64.
-    // Default = best on the B70 at M = 1024 (sweep_mt_m1024.txt).
-    int mt_m = 0, mt_n = 16, wg_m = 2, wg_n = 4;
+    // Default = most common best on the B70 at M = 1024 (bench.sh, select decode).
+    int mt_m = 0, mt_n = 32, wg_m = 4, wg_n = 2;
     bool grf256 = true;
+    bool int_dq = false;  // xetla's integer-op decode instead of predicated selects
     std::string cl_path;
     std::string extra_opts;
     bool print_build_log = false;
@@ -134,14 +135,19 @@ static void default_tiles(RunConfig &c) {
     int wgn = 64, ls = 1, u = 2;
     if (c.m == 1) {
         const int K = c.k, N = c.n;
-        if (K == 5120 && N == 34816)       { wgn = 16; ls = 4; u = 2; }  // gate_up
-        else if (K == 17408 && N == 5120)  { wgn = 32; ls = 4; u = 2; }  // down
-        else if (K == 5120 && N == 16384)  { wgn = 16; ls = 2; u = 1; }  // in_proj_qkvz
-        else if (K == 6144 && N == 5120)   { wgn = 32; ls = 6; u = 1; }  // out_proj
+        if (K == 5120 && N == 34816)       { wgn = 32; ls = 8; u = 1; }  // gate_up
+        else if (K == 17408 && N == 5120)  { wgn = 16; ls = 6; u = 1; }  // down
+        else if (K == 5120 && N == 16384)  { wgn = 32; ls = 2; u = 1; }  // in_proj_qkvz
+        else if (K == 6144 && N == 5120)   { wgn = 16; ls = 6; u = 1; }  // out_proj
         else if (K == 5120 && N == 14336)  { wgn = 32; ls = 2; u = 1; }  // qkv
-        else if (K == 5120 && N == 248320) { wgn = 16; ls = 4; u = 2; }  // lm_head
-        else if (N <= 8192)                { wgn = 32; ls = 4; u = 2; }
-        else                               { wgn = 16; ls = 2; u = 1; }
+        else if (K == 5120 && N == 248320) { wgn = 16; ls = 1; u = 1; }  // lm_head
+        else if (K == 4096 && N == 6144)   { wgn = 16; ls = 4; u = 1; }  // 8B qkv
+        else if (K == 4096 && N == 4096)   { wgn = 32; ls = 8; u = 1; }  // 8B o_proj
+        else if (K == 4096 && N == 24576)  { wgn = 64; ls = 1; u = 1; }  // 8B gate_up
+        else if (K == 12288 && N == 4096)  { wgn = 32; ls = 8; u = 1; }  // 8B down
+        else if (K == 4096 && N == 151680) { wgn = 32; ls = 1; u = 1; }  // 8B lm_head
+        else if (N <= 8192)                { wgn = 32; ls = 4; u = 1; }
+        else                               { wgn = 32; ls = 2; u = 1; }
     }
     if (c.nsg == 0) c.nsg = wgn / 16;
     if (c.ls == 0) c.ls = ls;
@@ -173,7 +179,8 @@ static void run(RunConfig cfg) {
 
     std::cout << "Device: " << name << "\n"
               << "Problem: M=" << M << " N=" << N << " K=" << K << " scale_gs=" << kGS
-              << " dtype=" << dt_name() << " epilogue=" << cfg.epi.name() << "\n";
+              << " dtype=" << dt_name() << " epilogue=" << cfg.epi.name()
+              << " decode=" << (cfg.int_dq ? "int" : "sel") << "\n";
     if (mt)
         std::cout << "Tile (mt): sg " << cfg.mt_m << "x" << cfg.mt_n << ", wg " << cfg.wg_m
                   << "x" << cfg.wg_n << " sub-groups" << (cfg.grf256 ? ", 256 GRF" : "") << "\n";
@@ -185,7 +192,8 @@ static void run(RunConfig cfg) {
     const char *srcp = src.c_str();
     cl_program prog = clCreateProgramWithSource(ctx, 1, &srcp, nullptr, &err);
     CL_CHECK(err);
-    std::string opts = std::string("-cl-std=CL3.0") + (dt_is_bf16() ? " -DBF16" : "") + " -DSGM="
+    std::string opts = std::string("-cl-std=CL3.0") + (dt_is_bf16() ? " -DBF16" : "")
+            + (cfg.int_dq ? " -DINT_DQ" : "") + " -DSGM="
             + std::to_string(cfg.sgm) + " -DNSG_N="
             + std::to_string(cfg.nsg) + " -DLS=" + std::to_string(cfg.ls) + " -DU="
             + std::to_string(cfg.u) + " -DPF=" + std::to_string(cfg.pf) + " -DMT_M="
@@ -398,6 +406,7 @@ int main(int argc, char **argv) {
         else if (a == "--wg-m" && i + 1 < argc) cfg.wg_m = ival(i);
         else if (a == "--wg-n" && i + 1 < argc) cfg.wg_n = ival(i);
         else if (a == "--grf128") cfg.grf256 = false;
+        else if (a == "--int-dq") cfg.int_dq = true;
         else if (a == "--cl" && i + 1 < argc) cfg.cl_path = argv[++i];
         else if (a == "--opts" && i + 1 < argc) cfg.extra_opts = argv[++i];
         else if (a == "--postop" && i + 1 < argc) {
@@ -410,7 +419,7 @@ int main(int argc, char **argv) {
             std::cout << "Usage: " << argv[0]
                       << " [--m M] [--n N] [--k K] [--dtype fp16|bf16] [--iters N] [--no-validate] [--distinct-sets]\n"
                          "       [--sets N | --weights-gib G] [--sgm 1|2|4|8] [--wgn W | --nsg S]\n"
-                         "       [--ls L] [--u U] [--pf P] [--mt-m 8k --mt-n 16k --wg-m W --wg-n W] [--grf128]\n"
+                         "       [--ls L] [--u U] [--pf P] [--mt-m 8k --mt-n 16k --wg-m W --wg-n W] [--grf128] [--int-dq]\n"
                          "       [--cl file.cl] [--opts \"-D... -cl-...\"] [--build-log]\n"
                          "       [--postop 0|1|2|3|4] [--out-f32]   epilogue: 0 none, 1 silu(acc)*other,\n"
                          "       2 acc+other, 3 acc+bias[n], 4 sigmoid(acc); --out-f32 = fp32 C/bias\n";

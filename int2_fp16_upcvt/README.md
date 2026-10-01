@@ -19,12 +19,26 @@ sidecars. N must be a multiple of 16, K a multiple of 128; any M works.
 
 ## Kernels ([int2_fp16_upcvt.cl](int2_fp16_upcvt.cl))
 
-**Dequantization** (both kernels, as in XeTLA, integer ops only). Each nibble
-(two K codes) becomes one VNNI dword `(scale2 ^ sign) & mask` holding both
-weights as 0 or +/-scale. One B word is exactly the `int8` B operand of
-`intel_sub_group_{f16_f16,bf16_bf16}_matrix_mad_k16`, so there is no shuffle
-and no SLM. This works for bf16 too: the sign is bit 15 and 0 is all-zero in
-both formats.
+**Dequantization** (both kernels): predicated selects on the unchanged
+XeTLA weight layout (inline vISA). Register `c` of the DPAS B operand, read
+as 32 16-bit channels, is channel `j` = (column `j/2`, row `2c + (j & 1)`). Both
+codes of row pair `c` sit in one half-word of lane `j/2`'s B word, so a SIMD32
+`and.nz` whose source region `<2;2,0>` hands each lane's half-word to its two
+channels, against a hoisted mask pair read as `<0;2,1>` (even / odd row),
+yields the sign and the nonzero predicate of all 32 channels at once:
+
+    (W)       and (32|M0) (ne)f1.0 null:uw  w.h<2;2,0>:uw  mk.sign<0;2,1>:uw
+    (W)       and (32|M0) (ne)f2.0 null:uw  w.h<2;2,0>:uw  mk.nz<0;2,1>:uw
+    (W&f1.0)  sel (32|M0) B[c]:uw  -s2  +s2
+    (W&~f2.0) mov (32|M0) B[c]:hf  0
+
+4 instructions per register (the `and` + `cmp.ne` pairs of the vISA fold into
+flag-writing `and`s), against about 10 for XeTLA's integer upconvert,
+`(scale2 ^ sign) & magnitude` per nibble, which `-DINT_DQ` (`--int-dq`) keeps.
+The output bits are the same (`+s`, `s ^ 0x8000`, `0`): results are
+bit-identical to the XeTLA plugin kernel, see
+[tools/xetla_epilogue_parity](../tools/xetla_epilogue_parity/). No shuffle,
+no SLM, and the same for bf16 (sign = bit 15).
 
 ### `int2_fp16_upcvt_gemm` (decode, M small)
 
@@ -80,7 +94,7 @@ Flags:
 | GEMV tile | `--sgm --wgn\|--nsg --ls --u --pf` |
 | large-M tile | `--mt-m --mt-n --wg-m --wg-n --grf128` |
 | epilogue | `--postop 0..4 --out-f32` |
-| debug | `--cl <file> --opts "-D..." --build-log` |
+| debug | `--cl <file> --opts "-D..." --build-log`, `--int-dq` (XeTLA's integer decode) |
 
 M >= 64 or `--mt-m` selects the large-M kernel. The default tiles are the B70
 27B table in `default_tiles()`; [bench.sh](bench.sh) sweeps the tiles per shape.
@@ -95,40 +109,44 @@ plugin's tuned per-arch config for every shape.
 
 ## Results (Arc Pro B70, fp16, median of 3, >= 2 GiB rotating weights)
 
-Decode GEMV, M = 1, with the plugin's tuned XeTLA config per shape. The 8B
-shapes, 27B down and 27B out_proj were measured on pcl-arl01 with the
-single-row B loads; the other 27B shapes are from the full run on pcl-zen4
-with the earlier 8-row B read.
+Decode GEMV, M = 1, with the plugin's tuned XeTLA config per shape (pcl-arl01,
+one full run). "before" = the previously published OpenCL times with XeTLA's
+integer decode (still available as `--int-dq`).
 
-| shape | K x N | XeTLA (us) | OpenCL (us) | speed-up |
-| --- | --- | --- | --- | --- |
-| 8B qkv | 4096 x 6144 | 16.70 | 16.51 | x1.01 |
-| 8B o_proj | 4096 x 4096 | 11.78 | 11.70 | x1.01 |
-| 8B gate_up | 4096 x 24576 | 58.38 | 55.36 | x1.05 |
-| 8B down | 12288 x 4096 | 29.91 | 28.95 | x1.03 |
-| 8B lm_head | 4096 x 151680 | 358.0 | 348.0 | x1.03 |
-| 27B gate_up | 5120 x 34816 | 109.7 | 103.7 | x1.06 |
-| 27B down | 17408 x 5120 | 54.38 | 51.82 | x1.05 |
-| 27B in_proj_qkvz | 5120 x 16384 | 47.93 | 47.11 | x1.02 |
-| 27B out_proj | 6144 x 5120 | 21.49 | 20.88 | x1.03 |
-| 27B qkv | 5120 x 14336 | 42.47 | 42.14 | x1.01 |
-| 27B lm_head | 5120 x 248320 | 733.2 | 693.7 | x1.06 |
+| shape | K x N | XeTLA (us) | OpenCL (us) | GiB/s | speed-up | before |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8B qkv | 4096 x 6144 | 16.72 | 14.39 | 434 | x1.16 | 16.51 |
+| 8B o_proj | 4096 x 4096 | 11.78 | 10.35 | 403 | x1.14 | 11.70 |
+| 8B gate_up | 4096 x 24576 | 58.39 | 47.23 | 528 | x1.24 | 55.36 |
+| 8B down | 12288 x 4096 | 29.96 | 25.19 | 496 | x1.19 | 28.95 |
+| 8B lm_head | 4096 x 151680 | 358.1 | 278.9 | 552 | x1.28 | 348.0 |
+| 27B gate_up | 5120 x 34816 | 109.7 | 86.81 | 509 | x1.26 | 103.7 |
+| 27B down | 17408 x 5120 | 54.27 | 42.76 | 517 | x1.27 | 51.82 |
+| 27B in_proj_qkvz | 5120 x 16384 | 47.93 | 40.05 | 519 | x1.20 | 47.11 |
+| 27B out_proj | 6144 x 5120 | 21.48 | 17.16 | 455 | x1.25 | 20.88 |
+| 27B qkv | 5120 x 14336 | 42.41 | 35.54 | 512 | x1.19 | 42.14 |
+| 27B lm_head | 5120 x 248320 | 731.9 | 572.5 | 550 | x1.28 | 693.7 |
+
+B70 peak is 608 GB/s (566 GiB/s); with the decode removed altogether the
+same kernel reads at up to 556 GiB/s, so the large shapes are now at the
+DRAM limit.
 
 Prefill, M = 1024. XeTLA runs the plugin's M-tiled prefill kernel
 (`--mtile 1`); OpenCL uses the best `gemm_mt` tile per shape.
 
-| shape | XeTLA (ms) | OpenCL (ms) | OpenCL TFLOPS | speed-up |
-| --- | --- | --- | --- | --- |
-| 8B qkv | 2.224 | 0.460 | 112 | x4.84 |
-| 8B o_proj | 1.487 | 0.322 | 107 | x4.62 |
-| 8B gate_up | 9.232 | 1.911 | 108 | x4.83 |
-| 8B down | 4.490 | 0.917 | 112 | x4.90 |
-| 8B lm_head | 58.22 | 12.48 | 102 | x4.67 |
-| 27B gate_up | 16.83 | 3.475 | 105 | x4.84 |
-| 27B down | 8.100 | 1.833 | 100 | x4.42 |
-| 27B in_proj_qkvz | 7.587 | 1.553 | 111 | x4.89 |
-| 27B out_proj | 2.796 | 0.634 | 102 | x4.41 |
-| 27B qkv | 6.553 | 1.338 | 112 | x4.90 |
-| 27B lm_head | 120.2 | 25.71 | 101 | x4.68 |
+| shape | XeTLA (ms) | OpenCL (ms) | OpenCL TFLOPS | speed-up | before (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 8B qkv | 2.200 | 0.421 | 122 | x5.22 | 0.460 |
+| 8B o_proj | 1.475 | 0.294 | 117 | x5.02 | 0.322 |
+| 8B gate_up | 9.059 | 1.739 | 119 | x5.21 | 1.911 |
+| 8B down | 4.396 | 0.835 | 124 | x5.27 | 0.917 |
+| 8B lm_head | 57.42 | 11.34 | 112 | x5.06 | 12.48 |
+| 27B gate_up | 16.39 | 3.173 | 115 | x5.17 | 3.475 |
+| 27B down | 7.915 | 1.673 | 109 | x4.73 | 1.833 |
+| 27B in_proj_qkvz | 7.496 | 1.415 | 121 | x5.30 | 1.553 |
+| 27B out_proj | 2.745 | 0.574 | 112 | x4.78 | 0.634 |
+| 27B qkv | 6.455 | 1.220 | 123 | x5.29 | 1.338 |
+| 27B lm_head | 118.6 | 23.56 | 111 | x5.03 | 25.71 |
 
-bf16 (27B shapes, B70): GEMV x1.01-1.07, GEMM x4.35-4.88 (100-113 TFLOPS).
+bf16 (27B shapes, B70): GEMV x1.20-1.29 (455-555 GiB/s), GEMM x4.74-5.33
+(111-125 TFLOPS); with the integer decode it was x1.01-1.07 and x4.35-4.88.

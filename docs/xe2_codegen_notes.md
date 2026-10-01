@@ -16,3 +16,15 @@ Findings from porting the XeTLA int2 kernels. They apply to XeTLA as well.
   silu store (all outputs 0). Multiply by `convert_float(x > -10)` instead.
 * **Guarded loads:** guarded per-lane `sub_group_block_read` gets serialized.
   Use 2D block reads (pitch % 16 B, width >= 64 B).
+* **Low-bit decode = predicated selects:** a VNNI2 DPAS B register, read as a
+  SIMD32 16-bit operand, is channel j = (column j/2, row 2c + (j & 1)).
+  Building it with `(P) sel (32) :uw -s2, +s2` (plus `(~Pz) mov 0` for ternary)
+  costs one instruction per register once the predicate exists. The
+  predicate comes from a scalar `setp` when the weights are stored in that
+  channel order (int1), or from a SIMD32 `and.nz` with source region
+  `<2;2,0>` (each lane's half-word to its two channels) against a `<0;2,1>`
+  mask pair when they are not (XeTLA int2 layout). IGC turns any OpenCL C
+  formulation into shifts and masks, so this needs inline vISA; `and` +
+  `cmp.ne 0` in vISA folds into one flag-writing `and`. The int2 decode drops
+  from ~10 to 4 instructions per register: x1.14-1.18 on decode GEMV, which
+  was ALU-bound (the int2 GEMV with the decode removed reaches 556 GiB/s).

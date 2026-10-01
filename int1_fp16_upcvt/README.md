@@ -84,31 +84,31 @@ The `--shl` path has 15 `shl` + 16 `bfn` per B word in the same loops.
 
 [bench.sh](bench.sh): best tile per shape, median of 3, >= 2 GiB of rotating
 weights, device-event times. GiB/s counts A + B + S + C; B70 peak is 608 GB/s
-(566 GiB/s). int2 = [int2_fp16_upcvt](../int2_fp16_upcvt/) OpenCL (README
-table, earlier B70 run).
+(566 GiB/s). int2 = [int2_fp16_upcvt](../int2_fp16_upcvt/) OpenCL with its
+select decode (same B70, same methodology).
 
 Decode GEMV, M = 1 (`sel` and `--shl` are equal within 0.5%, the kernel is
 DRAM-bound):
 
 | shape | K x N | tile (wgn, ls, u) | time (us) | GiB/s | % peak | vs int2 |
 | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 5120 x 34816 | 32, 4, 2 | 45.3 | 517 | 91% | x2.29 |
-| down | 17408 x 5120 | 16, 4, 2 | 23.3 | 502 | 89% | x2.22 |
-| in_proj_qkvz | 5120 x 16384 | 32, 2, 2 | 21.9 | 504 | 89% | x2.15 |
-| out_proj | 6144 x 5120 | 64, 4, 2 | 10.3 | 404 | 71% | x2.03 |
-| qkv | 5120 x 14336 | 32, 2, 2 | 19.5 | 495 | 87% | x2.16 |
-| lm_head | 5120 x 248320 | 32, 1, 2 | 302.2 | 553 | 98% | x2.30 |
+| gate_up | 5120 x 34816 | 32, 4, 2 | 45.3 | 517 | 91% | x1.92 |
+| down | 17408 x 5120 | 16, 4, 2 | 23.3 | 502 | 89% | x1.83 |
+| in_proj_qkvz | 5120 x 16384 | 32, 2, 2 | 21.9 | 504 | 89% | x1.83 |
+| out_proj | 6144 x 5120 | 64, 4, 2 | 10.3 | 404 | 71% | x1.67 |
+| qkv | 5120 x 14336 | 32, 2, 2 | 19.5 | 495 | 87% | x1.82 |
+| lm_head | 5120 x 248320 | 32, 1, 2 | 302.2 | 553 | 98% | x1.89 |
 
 Prefill, M = 1024:
 
 | shape | tile (mt, wg) | `--shl` (ms) | `sel` (ms) | `sel` TFLOPS | sel vs shl | vs int2 |
 | --- | --- | --- | --- | --- | --- | --- |
-| gate_up | 64x32, 4x4 | 2.834 | 2.795 | 130.6 | +1.4% | x1.24 |
-| down | 32x32, 1x8 | 1.359 | 1.343 | 135.9 | +1.2% | x1.36 |
-| in_proj_qkvz | 32x32, 2x2 | 1.291 | 1.255 | 136.9 | +2.9% | x1.24 |
-| out_proj | 32x32, 1x8 | 0.491 | 0.486 | 132.4 | +1.0% | x1.30 |
-| qkv | 32x32, 2x2 | 1.110 | 1.102 | 136.4 | +0.7% | x1.21 |
-| lm_head | 64x32, 4x2 | 21.37 | 20.92 | 124.5 | +2.1% | x1.23 |
+| gate_up | 64x32, 4x4 | 2.834 | 2.795 | 130.6 | +1.4% | x1.14 |
+| down | 32x32, 1x8 | 1.359 | 1.343 | 135.9 | +1.2% | x1.25 |
+| in_proj_qkvz | 32x32, 2x2 | 1.291 | 1.255 | 136.9 | +2.9% | x1.13 |
+| out_proj | 32x32, 1x8 | 0.491 | 0.486 | 132.4 | +1.0% | x1.18 |
+| qkv | 32x32, 2x2 | 1.110 | 1.102 | 136.4 | +0.7% | x1.11 |
+| lm_head | 64x32, 4x2 | 21.37 | 20.92 | 124.5 | +2.1% | x1.13 |
 
 With the dequantization replaced by a single `xor` (not a valid kernel, a
 ceiling), the same M-tiled loop reaches about 148 TFLOPS on qkv.
