@@ -2,9 +2,9 @@
 # int1_fp16_upcvt benchmark: tile sweep per shape (best of the OT list), then the
 # winner re-measured REPS times, median reported. >= 2 GiB of rotating distinct
 # weights, device-event times, IGC dumps off.
-#   ARCH=b70|lnl DT=fp16|bf16 M=1|1024 bash bench.sh <dir> <out.txt>   (M=1 -> GEMV tiles)
+#   ARCH=b70|lnl DT=fp16|bf16 M=1|1024 [X=--shl] bash bench.sh <dir> <out.txt>   (M=1 -> GEMV tiles)
 DT=${DT:-fp16}
-cd "$1"; OUT=$2; O="./build/int1_fp16_upcvt_ocl --dtype $DT"
+cd "$1"; OUT=$2; O="./build/int1_fp16_upcvt_ocl --dtype $DT ${X:-}"
 unset IGC_ShaderDumpEnable IGC_DumpToCustomDir
 M=${M:-1024}; IT=${IT:-20}; REPS=${REPS:-3}
 SHAPES=${SHAPES:-"27B.gate_up:5120:34816 27B.down:17408:5120 27B.qkvz:5120:16384 27B.out_proj:6144:5120 27B.qkv:5120:14336 27B.lm_head:5120:248320"}

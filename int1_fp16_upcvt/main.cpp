@@ -57,6 +57,7 @@ struct RunConfig {
     // work-group wg_m x wg_n sub-groups; used when mt_m > 0 or M >= 64.
     int mt_m = 0, mt_n = 32, wg_m = 2, wg_n = 4;
     bool grf256 = true;
+    bool sel = true;  // false (--shl): shift kernel path and its per-column bit order
     std::string cl_path;
     std::string extra_opts;
     bool print_build_log = false;
@@ -73,6 +74,22 @@ static float rnd_f(float lo, float hi) {
 }
 // bit of K row k within its word: VNNI2 bit order, even rows in the low half
 static int bit_pos(int k) { const int r = k % 32; return (r & 1) * 16 + r / 2; }
+
+// Select layout (see int1_fp16_upcvt.cl) from the per-column order above: within
+// each 16-word group of a K32 row, word p bit j = (row pair p, parity j & 1, column j / 2)
+static void to_sel_layout(const uint32_t *B, uint32_t *O, int K, int N) {
+#pragma omp parallel for collapse(2)
+    for (int kp = 0; kp < K / 32; ++kp)
+        for (int n0 = 0; n0 < N; n0 += 16) {
+            const uint32_t *src = B + (size_t)kp * N + n0;
+            for (int p = 0; p < 16; ++p) {
+                uint32_t w = 0;
+                for (int j = 0; j < 32; ++j)
+                    w |= ((src[j >> 1] >> ((j & 1) * 16 + p)) & 1u) << j;
+                O[(size_t)kp * N + n0 + p] = w;
+            }
+        }
+}
 
 // fp32 accumulator gold; the epilogue and output cast follow in epilogue_ref()
 static void compute_gold(const dt16 *A, const uint32_t *B, const dt16 *S,
@@ -133,9 +150,12 @@ static void default_tiles(RunConfig &c) {
     if (c.sgm == 0) c.sgm = c.m == 1 ? 1 : (c.m <= 2 ? 2 : (c.m <= 4 ? 4 : 8));
     int wgn = 64, ls = 1, u = 2;
     if (c.m == 1) {
-        const int N = c.n;
-        if (N <= 8192) { wgn = 32; ls = 4; u = 2; }
-        else           { wgn = 16; ls = 2; u = 2; }
+        const int K = c.k, N = c.n;
+        if (K == 17408 && N == 5120)      { wgn = 16; ls = 4; u = 2; }  // down
+        else if (K == 6144 && N == 5120)  { wgn = 64; ls = 4; u = 2; }  // out_proj
+        else if (N <= 8192)               { wgn = 32; ls = 4; u = 2; }
+        else if (K == 5120 && N == 34816) { wgn = 32; ls = 4; u = 2; }  // gate_up
+        else                              { wgn = 32; ls = 2; u = 2; }  // qkvz, qkv, lm_head
     }
     if (c.nsg == 0) c.nsg = wgn / 16;
     if (c.ls == 0) c.ls = ls;
@@ -167,7 +187,8 @@ static void run(RunConfig cfg) {
 
     std::cout << "Device: " << name << "\n"
               << "Problem: M=" << M << " N=" << N << " K=" << K << " scale_gs=" << kGS
-              << " dtype=" << dt_name() << " epilogue=" << cfg.epi.name() << "\n";
+              << " dtype=" << dt_name() << " epilogue=" << cfg.epi.name()
+              << " dequant=" << (cfg.sel ? "sel" : "shl") << "\n";
     if (mt)
         std::cout << "Tile (mt): sg " << cfg.mt_m << "x" << cfg.mt_n << ", wg " << cfg.wg_m
                   << "x" << cfg.wg_n << " sub-groups" << (cfg.grf256 ? ", 256 GRF" : "") << "\n";
@@ -179,7 +200,8 @@ static void run(RunConfig cfg) {
     const char *srcp = src.c_str();
     cl_program prog = clCreateProgramWithSource(ctx, 1, &srcp, nullptr, &err);
     CL_CHECK(err);
-    std::string opts = std::string("-cl-std=CL3.0") + (dt_is_bf16() ? " -DBF16" : "") + " -DSGM="
+    std::string opts = std::string("-cl-std=CL3.0") + (dt_is_bf16() ? " -DBF16" : "")
+            + (cfg.sel ? "" : " -DSHL") + " -DSGM="
             + std::to_string(cfg.sgm) + " -DNSG_N="
             + std::to_string(cfg.nsg) + " -DLS=" + std::to_string(cfg.ls) + " -DU="
             + std::to_string(cfg.u) + " -DBR=" + std::to_string(cfg.br) + " -DMT_M="
@@ -215,7 +237,7 @@ static void run(RunConfig cfg) {
 
     std::vector<dt16> A(size_a), S(size_s), Oth;
     std::vector<unsigned char> Bias, Ch(size_c * os);
-    std::vector<uint32_t> B(size_b);
+    std::vector<uint32_t> B(size_b), Bdev(cfg.sel ? size_b : 0);
     static std::mt19937 egen(std::random_device{}());
     auto fill = [&] {
 #pragma omp parallel for
@@ -249,7 +271,9 @@ static void run(RunConfig cfg) {
         }
         dA[s] = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, size_a * 2, A.data(), &err);
         CL_CHECK(err);
-        dB[s] = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, size_b * 4, B.data(), &err);
+        if (cfg.sel) to_sel_layout(B.data(), Bdev.data(), K, N);
+        dB[s] = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, size_b * 4,
+                cfg.sel ? Bdev.data() : B.data(), &err);
         CL_CHECK(err);
         dS[s] = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, size_s * 2, S.data(), &err);
         CL_CHECK(err);
@@ -388,6 +412,7 @@ int main(int argc, char **argv) {
         else if (a == "--wg-m" && i + 1 < argc) cfg.wg_m = ival(i);
         else if (a == "--wg-n" && i + 1 < argc) cfg.wg_n = ival(i);
         else if (a == "--grf128") cfg.grf256 = false;
+        else if (a == "--shl") cfg.sel = false;
         else if (a == "--cl" && i + 1 < argc) cfg.cl_path = argv[++i];
         else if (a == "--opts" && i + 1 < argc) cfg.extra_opts = argv[++i];
         else if (a == "--postop" && i + 1 < argc) {
@@ -400,7 +425,7 @@ int main(int argc, char **argv) {
             std::cout << "Usage: " << argv[0]
                       << " [--m M] [--n N] [--k K] [--dtype fp16|bf16] [--iters N] [--no-validate] [--distinct-sets]\n"
                          "       [--sets N | --weights-gib G] [--sgm 1|2|4|8] [--wgn W | --nsg S]\n"
-                         "       [--ls L] [--u U] [--br 1|2|4] [--mt-m 8k --mt-n 16k --wg-m W --wg-n W] [--grf128]\n"
+                         "       [--ls L] [--u U] [--br 1|2|4] [--mt-m 8k --mt-n 16k --wg-m W --wg-n W] [--grf128] [--shl]\n"
                          "       [--cl file.cl] [--opts \"-D... -cl-...\"] [--build-log]\n"
                          "       [--postop 0|1|2|3|4] [--out-f32]   epilogue: 0 none, 1 silu(acc)*other,\n"
                          "       2 acc+other, 3 acc+bias[n], 4 sigmoid(acc); --out-f32 = fp32 C/bias\n";

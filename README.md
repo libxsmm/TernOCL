@@ -8,18 +8,22 @@ Standalone OpenCL C kernels for ternary (2-bit, `{-1, 0, +1}` x per-group
 scale) weight GEMM/GEMV on Intel Xe2 GPUs (Arc Pro B70 / BMG, Arc 140V / Lunar
 Lake). Each variant is a drop-in, validated replacement for the matching XeTLA
 kernel of the vLLM xetla plugin: same data layouts, same numerics, same fused
-epilogues. Each is benchmarked against that kernel on identical inputs.
+epilogues. Each is benchmarked against that kernel on identical inputs. A
+1-bit (binary, `{-1, +1}` x per-group scale) variant with the same interface
+has no XeTLA counterpart and is compared against int2_fp16_upcvt.
 
 | variant                                                | math                                                                                  | activations  | XeTLA counterpart                                            |
 | ------------------------------------------------------ | ------------------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------ |
 | [int2_fp16_upcvt](int2_fp16_upcvt/)                     | int2 weights upconverted to fp16/bf16, fp16/bf16 DPAS, fp32 acc                       | fp16 or bf16 | `int2_fp16_upcvt_xmx_xe.hpp`                               |
 | [int2_via_int2_x_int8_dpas](int2_via_int2_x_int8_dpas/) | activations quantized to int8 (per row and 128-group), native s8 x s2 DPAS, int32 acc | fp16 or bf16 | `int2_fp16_dpas_xmx_xe.hpp`, `int2_bf16_dpas_xmx_xe.hpp` |
 | [bitcos_fp16_upcvt](bitcos_fp16_upcvt/)                 | BITCOS weights (presence bitmap + compacted signs, 2 - z bits/weight) unpacked through an SLM table, fp16/bf16 DPAS, fp32 acc | fp16 or bf16 | `bitcos_fp16_upcvt_xmx_xe.hpp` |
+| [int1_fp16_upcvt](int1_fp16_upcvt/)                     | 1-bit weights as predicates selecting hoisted `+s`/`-s` into the fp16/bf16 DPAS operand (inline vISA), fp32 acc | fp16 or bf16 | none |
 
 The int2 variants have a decode GEMV (M = 1..8) and a large-M GEMM (prefill), and
 handle any M (ragged tiles are zero-filled on read and clipped on write).
 They need `N % 16 == 0` and `K % 128 == 0`, with scale group size 128.
 The BITCOS variant has a decode GEMV (M = 1..8) and an M-tiled GEMM (prefill, any M).
+The int1 variant has the same kernels and constraints as int2_fp16_upcvt.
 
 ## Layout
 
@@ -34,6 +38,7 @@ int2_via_int2_x_int8_dpas/
                    kernel, driver, Makefile, validate.sh, bench.sh, xetla_ref/ + xetla_ref_bf16/
 bitcos_fp16_upcvt/ kernel, driver, Makefile, validate.sh, zsweep.sh (paper GEMV z sweep),
                    shapes27b.sh (Bonsai 27B shapes at one z)
+int1_fp16_upcvt/   kernel, driver, Makefile, validate.sh, bench.sh (Bonsai 27B shapes)
 tools/             xetla_epilogue_parity/ (bit-exact epilogue check and same-runtime GEMV bench
                    against the plugin's own kernel), tune_8b_small.sh
 run_all.sh         validate / epilogues / bench for every variant, dtype and M
@@ -56,6 +61,7 @@ source /swtools/intel/2026.0/oneapi-vars.sh --force
 make -C int2_fp16_upcvt CXX=g++
 make -C int2_via_int2_x_int8_dpas CXX=g++
 make -C bitcos_fp16_upcvt CXX=g++
+make -C int1_fp16_upcvt CXX=g++
 
 # XeTLA references (needs the xetla tree of the vLLM plugin)
 export XETLA=/path/to/xetla_vllm_plugin/xetla
@@ -137,6 +143,10 @@ times, tiles and bf16 numbers.
 
 On the Arc 140V (Lunar Lake) the BITCOS kernel is x1.00-1.25 over XeTLA BITCOS
 on the same 27B shapes.
+
+int1_fp16_upcvt on the 27B shapes (no XeTLA kernel; vs int2_fp16_upcvt OpenCL):
+GEMV M = 1 at 404-553 GiB/s (up to 98% of the 608 GB/s peak), x2.0-2.3;
+GEMM M = 1024 at 124-137 TFLOPS, x1.2-1.4.
 
 The BITCOS reference is the paper's own XeTLA harness; see
 [bitcos_fp16_upcvt/](bitcos_fp16_upcvt/) for the per-shape table and the

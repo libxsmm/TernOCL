@@ -4,19 +4,25 @@
 //   C[m,n] = DT( sum_k A[m,k] * sgn(B[k,n]) * S[k/128, n] ),  bit 0 -> +1, 1 -> -1
 //
 //   A : DT [M, K] row-major
-//   B : uint32 [K/32, N], word (kp, n) holds the bits of K rows 32*kp .. 32*kp+31
-//       of column n in VNNI2 bit order: row 32*kp + 2i at bit i, row
-//       32*kp + 2i + 1 at bit 16 + i (i = 0..15)
+//   B : uint32 [K/32, N] select masks; within K32 row kp and 16-column block
+//       n0, word (kp, n0 + p) holds the bits of row pair p (rows 32kp + 2p,
+//       32kp + 2p + 1) for columns n0..n0+15: bit j = (row 32kp + 2p + (j & 1),
+//       column n0 + j/2)
 //   S : DT [K/128, N]
 //   C : DT [M, N]
 //
 // DT is fp16, or bf16 with -DBF16. The B operand of the f16/bf16 DPAS is
 // VNNI2: dword c of lane n holds rows 2c (low half) and 2c+1 (high half) of
-// column n. With the bit order above, the two bits of pair i sit at bits i
-// and 16 + i, so one shift puts both on the DT sign bits (15, 31), and one
-// bfn merges them into the hoisted scale pair: (w << (15 - i)) & 0x80008000
-// selects -s where the bit is set and +s where it is clear. 2 ALU ops per
-// dword, no shuffles, no SLM.
+// column n, so register c of the operand, read as 32 16-bit channels, is
+// (column j/2, row 2c + (j & 1)) for channel j -- the bit order of one mask
+// word. Each DPAS register is then one predicated select between the
+// hoisted -s and +s pairs, with the weight word as the predicate:
+//   setp P <- w(lane c);  (P) sel (32) B[c]:uw  -s2, +s2
+// (inline vISA). No shifts, shuffles or SLM.
+//
+// -DSHL keeps the earlier shift path with a per-column VNNI2 bit order (word
+// (kp, n): row 32kp + 2i at bit i, 32kp + 2i + 1 at bit 16 + i), where
+// s2 ^ ((w << (15 - i)) & 0x80008000) builds dword i (shl + bfn, plain C).
 //
 // Work decomposition (compile-time via -D), as in int2_fp16_upcvt.cl:
 //   SGM    rows per sub-group (DPAS repeat count: 1, 2, 4, 8)
@@ -85,6 +91,34 @@ typedef float8 acc_t;
 #error "SGM must be 1, 2, 4 or 8"
 #endif
 
+#ifndef SHL
+// predicate of register c = mask word of row pair p, held by lane p
+#define SEL_ROW(c, p) \
+    "setp (M1_NM, 32) P" #c " %1(0," #p ")<0;1,0>\n" \
+    "(P" #c ") sel (M1_NM, 32) BW(" #c ",0)<1> NW(0,0)<1;1,0> PW(0,0)<1;1,0>\n"
+#define SEL_DECLS \
+    ".decl P0 v_type=P num_elts=32\n.decl P1 v_type=P num_elts=32\n" \
+    ".decl P2 v_type=P num_elts=32\n.decl P3 v_type=P num_elts=32\n" \
+    ".decl P4 v_type=P num_elts=32\n.decl P5 v_type=P num_elts=32\n" \
+    ".decl P6 v_type=P num_elts=32\n.decl P7 v_type=P num_elts=32\n" \
+    ".decl BW v_type=G type=uw num_elts=256 align=GRF alias=<%0,0>\n" \
+    ".decl PW v_type=G type=uw num_elts=32 align=GRF alias=<%2,0>\n" \
+    ".decl NW v_type=G type=uw num_elts=32 align=GRF alias=<%3,0>\n"
+
+inline int8 dq_half(uint w, uint s2, int h) {
+    const uint n2 = s2 ^ 0x80008000u;
+    int8 b;
+    if (h == 0)
+        __asm__("{\n" SEL_DECLS SEL_ROW(0, 0) SEL_ROW(1, 1) SEL_ROW(2, 2) SEL_ROW(3, 3)
+                SEL_ROW(4, 4) SEL_ROW(5, 5) SEL_ROW(6, 6) SEL_ROW(7, 7) "}\n"
+                : "=rw"(b) : "rw"(w), "rw"(s2), "rw"(n2));
+    else
+        __asm__("{\n" SEL_DECLS SEL_ROW(0, 8) SEL_ROW(1, 9) SEL_ROW(2, 10) SEL_ROW(3, 11)
+                SEL_ROW(4, 12) SEL_ROW(5, 13) SEL_ROW(6, 14) SEL_ROW(7, 15) "}\n"
+                : "=rw"(b) : "rw"(w), "rw"(s2), "rw"(n2));
+    return b;
+}
+#else
 // K rows 16h .. 16h+15 of a B word (h = 0, 1) -> the int8 VNNI2 B operand,
 // each DT weight +s or -s.
 inline int8 dq_half(uint w, uint s2, int h) {
@@ -94,6 +128,7 @@ inline int8 dq_half(uint w, uint s2, int h) {
         b[c] = (int)(s2 ^ ((w << (15 - 8 * h - c)) & 0x80008000u));
     return b;
 }
+#endif
 
 inline void load_b(const __global uint *B, int N, int K, int n0, int s,
         __private uint *w) {
