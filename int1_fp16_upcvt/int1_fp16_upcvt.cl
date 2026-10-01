@@ -273,16 +273,30 @@ __kernel void int1_fp16_upcvt_gemm(const __global dt *A,
 #endif
 #define MB (MT_M / 8)
 #define NB (MT_N / 16)
-// A rows per 2D block read (8, 16 or 32, dividing MT_M); each read is AR x 32 K
+// A rows per 2D block read (8, 16 or 32, dividing MT_M) and K per read (AK = 32
+// or 16; 32 K of A for MT_M > 64 does not fit in 256 GRF next to the accumulators)
 #ifndef AR
 #define AR (MT_M % 32 == 0 ? 32 : (MT_M % 16 == 0 ? 16 : 8))
 #endif
+#ifndef AK
+#define AK (MT_M <= 64 ? 32 : 16)
+#endif
+#if AK == 32
 #if AR == 32
 #define A_READ intel_sub_group_2d_block_read_16b_32r16x2c
 #elif AR == 16
 #define A_READ intel_sub_group_2d_block_read_16b_16r16x2c
 #else
 #define A_READ intel_sub_group_2d_block_read_16b_8r16x2c
+#endif
+#else
+#if AR == 32
+#define A_READ intel_sub_group_2d_block_read_16b_32r16x1c
+#elif AR == 16
+#define A_READ intel_sub_group_2d_block_read_16b_16r16x1c
+#else
+#define A_READ intel_sub_group_2d_block_read_16b_8r16x1c
+#endif
 #endif
 
 __attribute__((intel_reqd_sub_group_size(16)))
@@ -309,17 +323,18 @@ __kernel void int1_fp16_upcvt_gemm_mt(const __global dt *A,
                     K / GS, N * 2, (int2)(n0 + 16 * j, s), &sc);
             s2[j] = (uint)sc * 0x10001u;
         }
-        // one B word = K32 = one A block pair: A as AR-row x 32-column 2D reads
+        // one A read of AR rows x AK K feeds AK/16 K16 steps (half a B word each)
 #pragma unroll
-        for (int c2 = 0; c2 < WPS; ++c2) {
-            ushort a[MT_M / AR][2 * AR];
+        for (int c2 = 0; c2 < GS / AK; ++c2) {
+            ushort a[MT_M / AR][AK / 16 * AR];
             for (int i = 0; i < MT_M / AR; ++i)
                 A_READ((__global void *)A, K * 2, M, K * 2,
-                        (int2)(s * GS + 32 * c2, m0 + AR * i), a[i]);
+                        (int2)(s * GS + AK * c2, m0 + AR * i), a[i]);
 #pragma unroll
-            for (int h = 0; h < 2; ++h)
+            for (int h = 0; h < AK / 16; ++h)
                 for (int j = 0; j < NB; ++j) {
-                    const int8 b = dq_half(w[j][c2], s2[j], h);
+                    const int k16 = AK / 16 * c2 + h;
+                    const int8 b = dq_half(w[j][k16 / 2], s2[j], k16 % 2);
                     for (int i = 0; i < MB; ++i)
                         acc[i][j] = MAD(as_short8(vload8(0,
                                 &a[i / (AR / 8)][h * AR + 8 * (i % (AR / 8))])), b, acc[i][j]);

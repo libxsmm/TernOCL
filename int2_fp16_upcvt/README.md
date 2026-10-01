@@ -64,7 +64,12 @@ no SLM, and the same for bf16 (sign = bit 15).
 * **Memory:** A, B and C go through 2D block I/O, which zero-fills
   out-of-range reads and clips writes, so ragged M and N tiles need no masks.
 * **Loads:** B is one 8-row 2D read per 16-column block; `-DMT_B_ROWS` gives
-  single-row reads (experimental).
+  single-row reads (experimental). The scale is a 2D read too (no branch for
+  ragged N). A comes in `AR`-row x `AK`-K 2D reads (default `AR` = 32 and
+  `AK` = 32: one 2 KiB `16b_32r16x2c` message feeds two K16 DPAS steps of 32
+  rows; `AK` = 16 for `MT_M > 64`, whose 32-K A tile would spill). Against
+  one `8r16x1c` read per 8 rows per K16 this cuts the A messages 8x and gives
+  +12-19% at M = 1024 on the best tiles (`-DAR=8|16|32`, `-DAK=16|32`).
 * **Registers:** 256 GRF by default (`--grf128` for 128).
 * **fp16 spill fix:** an empty `asm volatile` on each accumulator before the
   store stops IGC from folding the fp16 conversion into the K loop, which

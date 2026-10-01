@@ -303,6 +303,31 @@ __kernel void int2_fp16_upcvt_gemm(const __global dt *A,
 #endif
 #define MB (MT_M / 8)
 #define NB (MT_N / 16)
+// A rows per 2D block read (8, 16 or 32, dividing MT_M) and K per read (AK = 32
+// or 16; 32 K of A for MT_M > 64 does not fit in 256 GRF next to the accumulators)
+#ifndef AR
+#define AR (MT_M % 32 == 0 ? 32 : (MT_M % 16 == 0 ? 16 : 8))
+#endif
+#ifndef AK
+#define AK (MT_M <= 64 ? 32 : 16)
+#endif
+#if AK == 32
+#if AR == 32
+#define A_READ intel_sub_group_2d_block_read_16b_32r16x2c
+#elif AR == 16
+#define A_READ intel_sub_group_2d_block_read_16b_16r16x2c
+#else
+#define A_READ intel_sub_group_2d_block_read_16b_8r16x2c
+#endif
+#else
+#if AR == 32
+#define A_READ intel_sub_group_2d_block_read_16b_32r16x1c
+#elif AR == 16
+#define A_READ intel_sub_group_2d_block_read_16b_16r16x1c
+#else
+#define A_READ intel_sub_group_2d_block_read_16b_8r16x1c
+#endif
+#endif
 
 __attribute__((intel_reqd_sub_group_size(16)))
 __attribute__((reqd_work_group_size(16 * WG_N * WG_M, 1, 1)))
@@ -329,22 +354,26 @@ __kernel void int2_fp16_upcvt_gemm_mt(const __global dt *A,
             intel_sub_group_2d_block_read_32b_8r16x1c((__global void *)B, N * 4,
                     K / 16, N * 4, (int2)(n0 + 16 * j, s * 8), w[j]);
 #endif
-            const uint sc = (n0 + 16 * j < N) ? intel_sub_group_block_read_us(
-                    (const __global ushort *)(S + (size_t)s * N + n0 + 16 * j)) : 0u;
-            s2[j] = sc | (sc << 16);
+            ushort sc;
+            intel_sub_group_2d_block_read_16b_1r16x1c((__global void *)S, N * 2,
+                    K / GS, N * 2, (int2)(n0 + 16 * j, s), &sc);
+            s2[j] = (uint)sc * 0x10001u;
         }
+        // one A read of AR rows x AK K feeds AK/16 K16 steps
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
-            ushort a[MB][8];
-            for (int i = 0; i < MB; ++i)
-                intel_sub_group_2d_block_read_16b_8r16x1c((__global void *)A,
-                        K * 2, M, K * 2, (int2)(s * GS + 16 * c, m0 + 8 * i), a[i]);
-            for (int j = 0; j < NB; ++j) {
-                const int8 b = dq_word(w[j][c], s2[j]);
-                for (int i = 0; i < MB; ++i)
-                    acc[i][j] = MAD(
-                            as_short8(vload8(0, a[i])), b, acc[i][j]);
-            }
+        for (int c2 = 0; c2 < GS / AK; ++c2) {
+            ushort a[MT_M / AR][AK / 16 * AR];
+            for (int i = 0; i < MT_M / AR; ++i)
+                A_READ((__global void *)A, K * 2, M, K * 2,
+                        (int2)(s * GS + AK * c2, m0 + AR * i), a[i]);
+#pragma unroll
+            for (int h = 0; h < AK / 16; ++h)
+                for (int j = 0; j < NB; ++j) {
+                    const int8 b = dq_word(w[j][AK / 16 * c2 + h], s2[j]);
+                    for (int i = 0; i < MB; ++i)
+                        acc[i][j] = MAD(as_short8(vload8(0,
+                                &a[i / (AR / 8)][h * AR + 8 * (i % (AR / 8))])), b, acc[i][j]);
+                }
         }
     }
 

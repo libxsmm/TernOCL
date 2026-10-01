@@ -55,8 +55,9 @@ before any compute), `BR` (B rows per 2D block read: 1, 2 or 4; 1 = one
 
 A sub-group computes an `MT_M x MT_N` tile; a work-group is `WG_M x WG_N`
 sub-groups. Per 128-K step: one 4-row 2D read of B and one 2D scale read per
-16-column block. Per B word (K32): `MT_M/AR` A reads of `AR x 32` (`AR` = 32
-by default: one 2 KiB `16b_32r16x2c` message per 32 rows), then each
+16-column block. A comes in `MT_M/AR` reads of `AR x AK` (`AR` = 32, `AK` = 32 by
+default: one 2 KiB `16b_32r16x2c` message per 32 rows and B word; `AK` = 16
+for `MT_M > 64`, whose 32-K A tile would spill), then each
 16-column block is dequantized once per K16 and reused for all `MT_M/8` DPAS.
 2D block I/O zero-fills out-of-range reads (A rows, B/S columns) and clips
 writes, so ragged tiles need no masks. 256 GRF by default (`--grf128`).
