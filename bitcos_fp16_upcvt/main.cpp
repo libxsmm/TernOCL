@@ -45,7 +45,7 @@ static constexpr int kGS = 128;
 struct RunConfig {
     int m = 1, n = 4096, k = 4096, iters = 50;
     double z = 0.40;
-    bool validate = true, distinct_sets = false, int_apply = false, simt_mul = false;
+    bool validate = true, distinct_sets = false, int_apply = false, simt_mul = false, visa_hmul = false, sign_il = false;
     int num_sets = 0;
     double weights_gib = 2.0;
     int sgm = 0, nsg = 0, ls = 0;  // 0 = default
@@ -151,14 +151,16 @@ static void run(RunConfig cfg) {
               << "Problem: M=" << M << " N=" << N << " K=" << K << " scale_gs=" << kGS
               << " z=" << cfg.z << " dtype=" << dt_name() << " epilogue=" << cfg.epi.name() << "\n"
               << "Tile: sg_m=" << cfg.sgm << " wg_n=" << 16 * cfg.nsg << " ls=" << cfg.ls
-              << " apply=" << (cfg.int_apply || dt_is_bf16() ? "int-and" : cfg.simt_mul ? "simt-hmul" : "visa-hmul") << "\n";
+              << " apply=" << (cfg.int_apply ? "int-and" : cfg.simt_mul ? "simt-hmul" : cfg.visa_hmul ? "visa-hmul"
+                                 : cfg.mt_m ? (dt_is_bf16() ? "int-and" : "visa-hmul") : "post-scale") << "\n";
 
     std::string src = read_file(cfg.cl_path);
     const char *srcp = src.c_str();
     cl_program prog = clCreateProgramWithSource(ctx, 1, &srcp, nullptr, &err);
     CL_CHECK(err);
     std::string opts = std::string("-cl-std=CL3.0") + (dt_is_bf16() ? " -DBF16" : "")
-            + (cfg.int_apply ? " -DINT_APPLY" : "") + (cfg.simt_mul ? " -DSIMT_HMUL" : "") + " -DSGM=" + std::to_string(cfg.sgm)
+            + (cfg.int_apply ? " -DINT_APPLY" : "") + (cfg.simt_mul ? " -DSIMT_HMUL" : "")
+            + (cfg.visa_hmul ? " -DVISA_HMUL" : "") + (cfg.sign_il ? " -DSIGN_IL" : "") + " -DSGM=" + std::to_string(cfg.sgm)
             + " -DNSG_N=" + std::to_string(cfg.nsg) + " -DLS=" + std::to_string(cfg.ls)
             + (cfg.mt_m ? " -DMT_M=" + std::to_string(cfg.mt_m) + " -DMT_N=" + std::to_string(cfg.mt_n) + " -DWG_M="
                           + std::to_string(cfg.wg_m) + " -DWG_N=" + std::to_string(cfg.wg_n) + " -cl-intel-256-GRF-per-thread"
@@ -183,7 +185,7 @@ static void run(RunConfig cfg) {
     static std::mt19937 egen(std::random_device{}());
     std::vector<dt16> A(size_a), S(size_s), Oth;
     std::vector<unsigned char> Bias, Ch(size_c * os);
-    Bitcos B;
+    Bitcos B, BI;  // BI: the device copy when --sign-il (gold decodes B)
     std::vector<uint32_t> SR;
     uint64_t seed = std::random_device{}();
     auto fill = [&] {
@@ -191,16 +193,19 @@ static void run(RunConfig cfg) {
         for (size_t i = 0; i < size_a; ++i) A[i] = fromf(rnd_f(-5.0f, 5.0f));
         for (size_t i = 0; i < size_s; ++i) S[i] = fromf(rnd_f(0.0f, 15.0f) + 0.75f);
         B = bitcos_random(K, N, cfg.z, seed++);
+        if (cfg.sign_il) BI = bitcos_interleave_signs(B);
         SR = bitcos_slice_ranks(B, cfg.ls);
         if (SR.empty()) SR.assign(1, 0);
         fill_epilogue_inputs(ep, Oth, Bias, M, N, egen);
     };
     fill();
-    const double wbytes_set = (double)B.bytes() + size_s * 2.0;
+    const Bitcos &BD = cfg.sign_il ? BI : B;
+    const double wbytes_set = (double)BD.bytes() + size_s * 2.0;
     const int sets = cfg.num_sets > 0 ? cfg.num_sets
                                       : std::max(1, (int)std::ceil(cfg.weights_gib * (1 << 30) / wbytes_set));
     std::cout << "BITCOS: measured z " << std::setprecision(4) << bitcos_zero_density(B) << ", "
-              << 8.0 * B.bytes() / ((double)K * N) << " bits/weight (+scales); weights "
+              << 8.0 * BD.bytes() / ((double)K * N) << " bits/weight (+scales)" << (cfg.sign_il ? ", sign-interleaved" : "")
+              << "; weights "
               << wbytes_set / (1 << 20) << " MiB/set, " << sets << " distinct sets -> " << std::fixed
               << std::setprecision(3) << wbytes_set * sets / (1 << 30) << " GiB\n";
 
@@ -224,10 +229,10 @@ static void run(RunConfig cfg) {
             fill();
             if (cfg.validate) make_gold(gold[s]);
         }
-        bbytes[s] = B.bytes();
+        bbytes[s] = BD.bytes();
         dA[s] = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, size_a * 2, A.data(), &err);
         CL_CHECK(err);
-        dB[s] = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, B.bytes(), B.buf.data(), &err);
+        dB[s] = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, BD.bytes(), (void *)BD.buf.data(), &err);
         CL_CHECK(err);
         dS[s] = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, size_s * 2, S.data(), &err);
         CL_CHECK(err);
@@ -357,6 +362,8 @@ int main(int argc, char **argv) {
         else if (a == "--distinct-sets") cfg.distinct_sets = true;
         else if (a == "--int-apply") cfg.int_apply = true;
         else if (a == "--simt-mul") cfg.simt_mul = true;
+        else if (a == "--visa-hmul") cfg.visa_hmul = true;
+        else if (a == "--sign-il") cfg.sign_il = true;
         else if (a == "--sgm" && i + 1 < argc) cfg.sgm = ival(i);
         else if (a == "--nsg" && i + 1 < argc) cfg.nsg = ival(i);
         else if (a == "--wgn" && i + 1 < argc) cfg.nsg = ival(i) / 16;
@@ -377,7 +384,7 @@ int main(int argc, char **argv) {
             std::cout << "Usage: " << argv[0]
                       << " [--m M] [--n N] [--k K] [--z Z] [--dtype fp16|bf16] [--iters N] [--no-validate]\n"
                          "       [--distinct-sets] [--sets N | --weights-gib G] [--sgm 1|2|4|8] [--wgn W | --nsg S]\n"
-                         "       [--ls L] [--int-apply | --simt-mul] [--cl file.cl] [--opts \"-D...\"] [--build-log]\n"
+                         "       [--ls L] [--int-apply | --visa-hmul | --simt-mul] [--sign-il] [--cl file.cl] [--opts \"-D...\"] [--build-log]\n"
                          "       [--postop 0|1|2|3|4] [--out-f32]\n";
             return a == "-h" || a == "--help" ? 0 : 1;
         }

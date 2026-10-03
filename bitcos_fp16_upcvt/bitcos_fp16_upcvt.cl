@@ -19,14 +19,19 @@
 //   - each block is decoded as 8 four-row groups: the presence nibble and the
 //     next four sign bits index a 256-entry SLM table of four DT codes {0, +1,
 //     -1} in VNNI order (a 4-bit pdep), the window then shifts by
-//     popcount(nibble), and the codes are scaled. fp16 (default): xetla's
-//     two SIMD32 hf multiplies on the looked-up dwords, as inline vISA
-//     (VISA_HMUL; SIMT_HMUL = plain OpenCL half4 * half, which IGC de- and
-//     re-interleaves, 369 vs 213 loop instructions). INT_APPLY (bf16, which
-//     has no 16-bit multiply; optional for fp16, bit-identical): the table
-//     holds 0 / 0x7fff / 0xffff masks and one AND with (scale | 0x8000) makes
-//     0 / +s / -s exactly;
+//     popcount(nibble);
 //   - two DPAS of k = 16 per block, fp32 accumulate.
+// Scale apply (S is constant over a 64-k step):
+//   - POST_SCALE (GEMV default, fp16 and bf16): the table holds DT +-1, the
+//     step's DPAS sum into a zeroed fp32 partial, and acc += partial * s;
+//   - VISA_HMUL (gemm_mt fp16 default): xetla's two SIMD32 hf multiplies of
+//     the looked-up dwords by s, as inline vISA;
+//   - SIMT_HMUL: the same in plain OpenCL (half4 * half), which IGC de- and
+//     re-interleaves (369 vs 213 loop instructions);
+//   - INT_APPLY (gemm_mt bf16 default, bf16 has no 16-bit multiply): the
+//     table holds 0 / 0x7fff / 0xffff and one AND with (s | 0x8000) gives
+//     0 / +s / -s exactly.
+// -DINT_APPLY / -DVISA_HMUL / -DSIMT_HMUL select that apply for both kernels.
 // Work decomposition: SGM rows per sub-group (DPAS repeat count), NSG_N
 // sub-groups along N, LS sub-groups splitting K (reduced through SLM; slice s
 // starts at the column's rank SR[s-1]). Requires N % 16 == 0 and
@@ -40,20 +45,37 @@
 #define TOF8(h8) as_float8(convert_uint8(h8) << 16)
 #define TO_DT(x) intel_convert_bfloat16_as_ushort(x)
 #define TO_DT8(x) intel_convert_bfloat168_as_ushort8(x)
-#ifndef INT_APPLY
-#define INT_APPLY
-#endif
+#define DT_ONE 0x3f80u
 #else
 #define MAD intel_sub_group_f16_f16_matrix_mad_k16
 #define TOF(h) convert_float(as_half(h))
 #define TOF8(h8) convert_float8(as_half8(h8))
 #define TO_DT(x) as_ushort(convert_half(x))
 #define TO_DT8(x) as_ushort8(convert_half8(x))
-#if !defined(INT_APPLY) && !defined(SIMT_HMUL) && !defined(VISA_HMUL)
-#define VISA_HMUL
-#endif
+#define DT_ONE 0x3c00u
 #endif
 typedef ushort dt;  // raw DT bits
+
+#define AP_POST 0
+#define AP_INT 1
+#define AP_VISA 2
+#define AP_SIMT 3
+#if defined(INT_APPLY)
+#define GEMV_AP AP_INT
+#define MT_AP AP_INT
+#elif defined(VISA_HMUL) && !defined(BF16)
+#define GEMV_AP AP_VISA
+#define MT_AP AP_VISA
+#elif defined(SIMT_HMUL) && !defined(BF16)
+#define GEMV_AP AP_SIMT
+#define MT_AP AP_SIMT
+#elif defined(BF16)
+#define GEMV_AP AP_POST
+#define MT_AP AP_INT
+#else
+#define GEMV_AP AP_POST
+#define MT_AP AP_VISA
+#endif
 
 #include "epilogue.clh"
 
@@ -85,13 +107,6 @@ typedef float8 acc_t;
 #error "SGM must be 1, 2, 4 or 8"
 #endif
 
-#ifdef INT_APPLY
-#define CODE_POS 0x7fffu
-#define CODE_NEG 0xffffu
-#else
-#define CODE_POS 0x3c00u  // fp16 +1
-#define CODE_NEG 0xbc00u  // fp16 -1
-#endif
 
 #ifndef NO_SIGN_CACHE_HINT
 // IGC's LSC load with an explicit cache control: XeTLA gathers the sign words
@@ -105,9 +120,20 @@ uint3 __builtin_IB_lsc_load_global_uint3(const __global uint3 *base, int imm_ele
 #define LOAD_SIGNS(p) vload3(0, (p))
 #endif
 
+// The 3-word sign window at word w of the stream that starts at o. SIGN_IL
+// (common/bitcos.hpp bitcos_interleave_signs): word w of a column at o + 16*w,
+// so lanes at the same w read one 64 B line.
+#ifdef SIGN_IL
+#define GATHER_SIGNS(o, w) (uint3)(signs[(o) + 16 * (w)], signs[(o) + 16 * (w) + 16], signs[(o) + 16 * (w) + 32])
+#else
+#define GATHER_SIGNS(o, w) LOAD_SIGNS(signs + (o) + (w))
+#endif
+
 // Entry (m, s), m = presence nibble of rows 4g..4g+3, s = next four compact
 // sign bits: row i is 0 if absent, else the sign bit of rank sum(m_j, j < i).
-inline void build_lut(__local uint2 *lut) {
+// Codes: AND masks 0x7fff / 0xffff for AP_INT, DT +1 / -1 otherwise.
+inline void build_lut(__local uint2 *lut, int ap) {
+    const uint CODE_POS = ap == AP_INT ? 0x7fffu : DT_ONE, CODE_NEG = ap == AP_INT ? 0xffffu : DT_ONE | 0x8000u;
     const int n = get_local_size(0);
     for (int idx = get_local_id(0); idx < 256; idx += n) {
         const uint m = (uint)idx >> 4, s = (uint)idx & 15u;
@@ -133,7 +159,7 @@ inline uint sign_window(uint3 q, uint w0, uint rank) {
 }
 
 // One block: bitmap word bmp, sign window w -> two k16 VNNI B operands.
-#ifdef VISA_HMUL
+#ifndef BF16
 // xetla's scale apply: the two looked-up dwords per lane (4 interleaved hf codes)
 // times the lane's scale replicated in both halves, as two SIMD32 hf muls in place
 // (SIMT half4 * half would de-interleave into 4 SIMD16 muls and re-interleave).
@@ -150,28 +176,28 @@ inline uint2 hmul2(uint2 e, uint s2) {
 }
 #endif
 
-inline void unpack_block(__local const uint2 *lut, uint bmp, uint w, uint sx, int8 *b0, int8 *b1) {
+// sx: the scale operand of `ap` (unused for AP_POST).
+inline void unpack_block(__local const uint2 *lut, uint bmp, uint w, uint sx, int ap, int8 *b0, int8 *b1) {
     uint d[16];
 #pragma unroll
     for (int g = 0; g < 8; ++g) {
         const uint m4 = (bmp >> (4 * g)) & 15u;
-        const uint2 e = lut[(m4 << 4) | (w & 15u)];
+        uint2 e = lut[(m4 << 4) | (w & 15u)];
         w >>= popcount(m4);
-#ifdef INT_APPLY
-        d[2 * g] = e.x & sx;
-        d[2 * g + 1] = e.y & sx;
-#elif defined(VISA_HMUL)
-        const uint2 v = hmul2(e, sx);
-        d[2 * g] = v.x;
-        d[2 * g + 1] = v.y;
-#else
-        const half4 v = as_half4(e) * as_half2(sx).x;
-        d[2 * g] = as_uint2(v).x;
-        d[2 * g + 1] = as_uint2(v).y;
+        if (ap == AP_INT) e &= sx;
+#ifndef BF16
+        else if (ap == AP_VISA) e = hmul2(e, sx);
+        else if (ap == AP_SIMT) e = as_uint2(as_half4(e) * as_half2(sx).x);
 #endif
+        d[2 * g] = e.x;
+        d[2 * g + 1] = e.y;
     }
     *b0 = as_int8((uint8)(d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]));
     *b1 = as_int8((uint8)(d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]));
+}
+
+inline uint scale_operand(uint sc, int ap) {
+    return ap == AP_INT ? (sc | 0x8000u) * 0x10001u : ap == AP_VISA ? sc * 0x10001u : sc;
 }
 
 __attribute__((intel_reqd_sub_group_size(16)))
@@ -180,7 +206,7 @@ __kernel void bitcos_fp16_upcvt_gemv(const __global dt *A, const __global uint *
         const __global dt *S, const __global uint *SR, __global ct *C, EPI_ARGS,
         int M, int N, int K) {
     __local uint2 lut[256];
-    build_lut(lut);
+    build_lut(lut, GEMV_AP);
 
     const int lane = get_sub_group_local_id();
     const int sg = get_sub_group_id();
@@ -213,18 +239,19 @@ __kernel void bitcos_fp16_upcvt_gemv(const __global dt *A, const __global uint *
             const uint r0 = rank, r1 = r0 + popcount(bm[0]);
             rank = r1 + popcount(bm[1]);
             const uint w0 = r0 >> 5;
-            const uint3 q = LOAD_SIGNS(signs + off + w0);
-#ifdef INT_APPLY
-            const uint sx = (sc | 0x8000u) * 0x10001u;
-#elif defined(VISA_HMUL)
-            const uint sx = sc * 0x10001u;
-#else
-            const uint sx = sc;
+            const uint3 q = GATHER_SIGNS(off, w0);
+#ifdef PFD
+            // Bitmap PFD steps ahead; helps long K slices (few column tiles), hurts wide N.
+            if (k + PFD * STEP < k_end)
+                intel_sub_group_2d_block_prefetch_32b_2r16x1c((__global void *)B, N * 4, K / 32, N * 4,
+                        (int2)(n0, (k + PFD * STEP) / 32));
 #endif
+            const uint sx = scale_operand(sc, GEMV_AP);
+            acc_t p = GEMV_AP == AP_POST ? (acc_t)0.0f : acc;
 #pragma unroll
             for (int ii = 0; ii < 2; ++ii) {
                 int8 b0, b1;
-                unpack_block(lut, bm[ii], sign_window(q, w0, ii ? r1 : r0), sx, &b0, &b1);
+                unpack_block(lut, bm[ii], sign_window(q, w0, ii ? r1 : r0), sx, GEMV_AP, &b0, &b1);
                 a_t a0, a1;
 #if SGM == 1
                 a0 = as_short(ar[0][2 * ii]);
@@ -235,9 +262,10 @@ __kernel void bitcos_fp16_upcvt_gemv(const __global dt *A, const __global uint *
                     a1[r] = as_short(ar[r][2 * ii + 1]);
                 }
 #endif
-                acc = MAD(a0, b0, acc);
-                acc = MAD(a1, b1, acc);
+                p = MAD(a0, b0, p);
+                p = MAD(a1, b1, p);
             }
+            acc = GEMV_AP == AP_POST ? p * TOF((ushort)sc) + acc : p;
         }
     }
 
@@ -304,7 +332,7 @@ __kernel void bitcos_fp16_upcvt_gemm_mt(const __global dt *A, const __global uin
         const __global dt *S, const __global uint *SR, __global ct *C, EPI_ARGS,
         int M, int N, int K) {
     __local uint2 lut[256];
-    build_lut(lut);
+    build_lut(lut, MT_AP);
 
     const int lane = get_sub_group_local_id();
     const int sg = get_sub_group_id();
@@ -338,18 +366,12 @@ __kernel void bitcos_fp16_upcvt_gemm_mt(const __global dt *A, const __global uin
             const uint r0 = rank[j], r1 = r0 + popcount(bm[0]);
             rank[j] = r1 + popcount(bm[1]);
             const uint w0 = r0 >> 5;
-            const uint3 q = LOAD_SIGNS(signs + off[j] + w0);
-#ifdef INT_APPLY
-            const uint sx = (sc | 0x8000u) * 0x10001u;
-#elif defined(VISA_HMUL)
-            const uint sx = sc * 0x10001u;
-#else
-            const uint sx = sc;
-#endif
+            const uint3 q = GATHER_SIGNS(off[j], w0);
+            const uint sx = scale_operand(sc, MT_AP);
 #pragma unroll
             for (int ii = 0; ii < 2; ++ii) {
                 int8 b0, b1;
-                unpack_block(lut, bm[ii], sign_window(q, w0, ii ? r1 : r0), sx, &b0, &b1);
+                unpack_block(lut, bm[ii], sign_window(q, w0, ii ? r1 : r0), sx, MT_AP, &b0, &b1);
                 for (int i = 0; i < MB; ++i) {
                     acc[i][j] = MAD(as_short8(vload8(0, a[i][2 * ii])), b0, acc[i][j]);
                     acc[i][j] = MAD(as_short8(vload8(0, a[i][2 * ii + 1])), b1, acc[i][j]);

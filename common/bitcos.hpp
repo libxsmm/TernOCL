@@ -112,3 +112,34 @@ inline double bitcos_zero_density(const Bitcos &b) {
     for (long i = 0; i < (long)b.bitmap_words(); ++i) s += __builtin_popcount(b.buf[i]);
     return 1.0 - (double)s / ((double)b.K * b.N);
 }
+
+// Sign-interleaved variant (not xetla's format; the kernels' -DSIGN_IL): within each
+// 16-column tile, sign word j of column n sits at tile_base + 16*j + n%16 (columns
+// padded to the tile's longest stream, plus 2 rows for the 3-word window), and
+// offsets[n] = tile_base + n%16. Bitmap and slice ranks are unchanged.
+inline Bitcos bitcos_interleave_signs(const Bitcos &b) {
+    const size_t bw = b.bitmap_words(), N = (size_t)b.N;
+    const uint32_t *off = b.buf.data() + b.offsets_base();
+    const size_t total = b.buf.size() - kBitcosPad - b.signs_base();
+    auto nwords = [&](size_t n) { return (n + 1 < N ? off[n + 1] : total) - off[n]; };
+    std::vector<size_t> base(N / 16 + 1, 0);
+    for (size_t t = 0; t < N / 16; ++t) {
+        size_t w = 0;
+        for (size_t l = 0; l < 16; ++l) w = std::max(w, nwords(16 * t + l));
+        base[t + 1] = base[t] + 16 * (w + 2);
+    }
+    Bitcos r;
+    r.K = b.K;
+    r.N = b.N;
+    r.buf.assign(bw + N + base[N / 16] + kBitcosPad, 0);
+    std::copy(b.buf.begin(), b.buf.begin() + bw, r.buf.begin());
+    uint32_t *roff = r.buf.data() + bw, *rs = r.buf.data() + r.signs_base();
+    const uint32_t *s = b.buf.data() + b.signs_base();
+#pragma omp parallel for
+    for (size_t n = 0; n < N; ++n) {
+        const size_t tb = base[n / 16], l = n % 16;
+        roff[n] = (uint32_t)(tb + l);
+        for (size_t j = 0; j < nwords(n); ++j) rs[tb + 16 * j + l] = s[off[n] + j];
+    }
+    return r;
+}
