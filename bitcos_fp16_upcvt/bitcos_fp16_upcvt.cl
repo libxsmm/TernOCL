@@ -132,6 +132,14 @@ uint3 __builtin_IB_lsc_load_global_uint3(const __global uint3 *base, int imm_ele
 // Entry (m, s), m = presence nibble of rows 4g..4g+3, s = next four compact
 // sign bits: row i is 0 if absent, else the sign bit of rank sum(m_j, j < i).
 // Codes: AND masks 0x7fff / 0xffff for AP_INT, DT +1 / -1 otherwise.
+// LUT_T: entry (m, s) at s << 4 | m, so a fixed presence nibble (z near 0 or 1) with random
+// signs gathers entries 128 B apart; adjacent distinct entries in one gather are slow on Xe2-LPG.
+#ifdef LUT_T
+#define LUT_IDX(m, s) (((s) << 4) | (m))
+#else
+#define LUT_IDX(m, s) (((m) << 4) | (s))
+#endif
+
 inline void build_lut(__local uint2 *lut, int ap) {
     const uint CODE_POS = ap == AP_INT ? 0x7fffu : DT_ONE, CODE_NEG = ap == AP_INT ? 0xffffu : DT_ONE | 0x8000u;
     const int n = get_local_size(0);
@@ -144,7 +152,7 @@ inline void build_lut(__local uint2 *lut, int ap) {
             c[i] = p ? (((s >> r) & 1u) ? CODE_NEG : CODE_POS) : 0u;
             r += p;
         }
-        lut[idx] = (uint2)(c[0] | (c[1] << 16), c[2] | (c[3] << 16));
+        lut[LUT_IDX(m, s)] = (uint2)(c[0] | (c[1] << 16), c[2] | (c[3] << 16));
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 }
@@ -182,7 +190,7 @@ inline void unpack_block(__local const uint2 *lut, uint bmp, uint w, uint sx, in
 #pragma unroll
     for (int g = 0; g < 8; ++g) {
         const uint m4 = (bmp >> (4 * g)) & 15u;
-        uint2 e = lut[(m4 << 4) | (w & 15u)];
+        uint2 e = lut[LUT_IDX(m4, w & 15u)];
         w >>= popcount(m4);
         if (ap == AP_INT) e &= sx;
 #ifndef BF16
