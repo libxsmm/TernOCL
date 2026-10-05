@@ -40,7 +40,7 @@ inline Bitcos bitcos_random(int K, int N, double z, uint64_t seed) {
     {
         std::mt19937 g((uint32_t)(seed * 7919u + omp_get_thread_num()));
 #pragma omp for schedule(static)
-        for (long i = 0; i < (long)bw; ++i) {
+        for (long long i = 0; i < (long long)bw; ++i) {
             uint32_t w = 0;
             for (int c = 0; c < 32; ++c) w |= (uint32_t)(g() < thr) << c;
             bmp[i] = w;
@@ -109,6 +109,6 @@ inline void bitcos_decode_col(const Bitcos &b, int n, int8_t *codes) {
 inline double bitcos_zero_density(const Bitcos &b) {
     uint64_t s = 0;
 #pragma omp parallel for reduction(+ : s)
-    for (long i = 0; i < (long)b.bitmap_words(); ++i) s += __builtin_popcount(b.buf[i]);
+    for (long long i = 0; i < (long long)b.bitmap_words(); ++i) s += __builtin_popcount(b.buf[i]);
     return 1.0 - (double)s / ((double)b.K * b.N);
 }

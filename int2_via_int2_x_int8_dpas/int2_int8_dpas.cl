@@ -54,9 +54,13 @@ typedef ushort dt;  // raw DT bits
 #define LDSA(M) (((M) + 31) & ~31)
 #define EPS 1.1920928955078125e-07f  /* FLT_EPSILON, xetla absmax init */
 
-// GEMV path: clamp + RTZ convert lowers to one mov.sat per element
+// GEMV path: two DT -> two int8, rounded to nearest even: + 1.5 * 2^23 rounds
+// into the low mantissa bits (|f * sa| <= 127.5), whose low byte is the int8
 inline short q2(uint h2, float sa) {
-    return as_short(convert_char2(clamp(TOF2(h2) * sa, -128.0f, 127.0f)));
+    const float2 f = TOF2(h2);
+    const uint u0 = as_uint(fma(f.s0, sa, 12582912.0f));
+    const uint u1 = as_uint(fma(f.s1, sa, 12582912.0f));
+    return as_short((ushort)((u0 & 0xffu) | ((u1 & 0xffu) << 8)));
 }
 
 // xetla's elemwise_scale_{fp16,bf16}_to_int8 on one 8-row x 32-K block, on the
@@ -77,10 +81,11 @@ inline short8 quant8x32(uint8 a, float sal) {
         ".decl T v_type=G type=f num_elts=256 align=GRF\n"
         ".decl TD v_type=G type=ud num_elts=256 align=GRF alias=<T,0>\n"
         ".decl TB v_type=G type=b num_elts=1024 align=GRF alias=<T,0>\n"
+// a * sal + 1.5 * 2^23 rounds to nearest even into the low mantissa bits
+// (|a * sal| <= 127.5); the low byte of each float is the int8.
 #define QROW(r, g, orow, ocol) \
         A2F(r, g) \
-        "mul (M1_NM, 32) T(" #g ",0)<1> T(" #g ",0)<1;1,0> %2(0," #r ")<0;1,0>\n" \
-        "mov.sat (M1_NM, 32) TB(" #g ",0)<4> T(" #g ",0)<1;1,0>\n" \
+        "mad (M1_NM, 32) T(" #g ",0)<1> T(" #g ",0)<1;1,0> %2(0," #r ")<0;1,0> 0x4b400000:f\n" \
         "mov (M1_NM, 32) QB(" #orow "," #ocol ")<1> TB(" #g ",0)<4;1,0>\n"
         QROW(0, 0, 0,0) QROW(1, 2, 0,32) QROW(2, 4, 1,0) QROW(3, 6, 1,32)
         QROW(4, 8, 2,0) QROW(5, 10, 2,32) QROW(6, 12, 3,0) QROW(7, 14, 3,32)
@@ -107,7 +112,7 @@ __kernel void quant_a(const __global dt *A, __global dt *SA,
     const dt sh = TO_DT(127.0f / fmax(mx, EPS));
     if (lane == 0) SA[(size_t)g * LDSA(M) + m] = sh;
 #ifdef WRITE_Q
-    vstore8(convert_char8_sat(a * TOF(sh)), 0, Aq + off);
+    vstore8(convert_char8_sat_rte(a * TOF(sh)), 0, Aq + off);
 #endif
 }
 
@@ -341,7 +346,8 @@ __kernel void int2_int8_gemm_mt(const __global dt *A, const __global char *Aq,
             for (int c = 0; c < 4; ++c) aq[c] = as_short8(vload8(0, &t[c / 2][8 * (c % 2)]));
             const float sal = load_sa(SA, M, K, mr, s);
             // rows >= M get inf here, but their int32 dot is 0 and the store clips them
-            for (int r = 0; r < 8; ++r) inv[r] = native_recip(sub_group_broadcast(sal, r));
+            const float invl = native_recip(sal);
+            for (int r = 0; r < 8; ++r) inv[r] = sub_group_broadcast(invl, r);
 #else
             uint a[4][8];
             for (int c = 0; c < 4; ++c)
@@ -349,7 +355,8 @@ __kernel void int2_int8_gemm_mt(const __global dt *A, const __global char *Aq,
                         K * 2, (int2)(s * GS / 2 + 16 * c, mr), a[c]);
             const float sal = load_sa(SA, M, K, mr, s);
             for (int c = 0; c < 4; ++c) aq[c] = quant8x32(vload8(0, a[c]), sal);
-            for (int r = 0; r < 8; ++r) inv[r] = native_recip(sub_group_broadcast(sal, r));
+            const float invl = native_recip(sal);
+            for (int r = 0; r < 8; ++r) inv[r] = sub_group_broadcast(invl, r);
 #endif
             for (int j = 0; j < NB; ++j) {
                 int8 ia = 0;

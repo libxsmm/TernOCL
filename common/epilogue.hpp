@@ -50,7 +50,7 @@ inline void fill_epilogue_inputs(const Epilogue &e, std::vector<dt16> &other,
 inline void epilogue_ref(const Epilogue &e, const float *acc, const dt16 *other,
         const unsigned char *bias, unsigned char *out, int M, int N) {
 #pragma omp parallel for
-    for (long i = 0; i < (long)M * N; ++i) {
+    for (long long i = 0; i < (long long)M * N; ++i) {
         float v = acc[i];
         const int n = (int)(i % N);
         if (e.postop == 1) v = v * sigmoid_ref(v) * tof(other[i]);
