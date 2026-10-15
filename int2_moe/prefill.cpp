@@ -80,6 +80,9 @@ static void fill_proj(Proj &p, std::mt19937 &rng) {
 
 int main(int argc, char **argv) {
     int T = 1024, E = 128, TOPK = 8, H = 2048, I = 768, sets = 8, iters = 10, check = 4;
+    bool int8 = false;
+    int qmode = 1;
+    std::string dump_up;
     Tile tile;
     std::string dir = ".";
     for (int i = 1; i < argc; ++i) {
@@ -98,10 +101,12 @@ int main(int argc, char **argv) {
             std::istringstream in(next());
             in >> tile.mt_m >> c >> tile.mt_n >> c >> tile.wg_m >> c >> tile.wg_n;
         } else if (a == "--dir") dir = next();
+        else if (a == "--int8") int8 = true, qmode = std::stoi(next());
+        else if (a == "--dump-up") dump_up = next();
         else {
             std::cerr << "usage: " << argv[0]
                       << " [--t T] [--e E] [--topk K] [--h H] [--i I] [--sets S] [--iters N] [--check C]"
-                         " [--tile mt_m,mt_n,wg_m,wg_n] [--dir kernel_dir]\n";
+                         " [--tile mt_m,mt_n,wg_m,wg_n] [--dir kernel_dir] [--int8 qmode] [--dump-up file]\n";
             return 1;
         }
     }
@@ -124,15 +129,16 @@ int main(int argc, char **argv) {
     cl_command_queue q = clCreateCommandQueueWithProperties(ctx, dev, qp, &err);
     CL_CHECK(err);
     std::cout << "Prefill: T=" << T << " E=" << E << " topk=" << TOPK << " H=" << H << " I=" << I << " tile " << tile.mt_m
-              << "x" << tile.mt_n << " wg " << tile.wg_m << "x" << tile.wg_n << "\n";
+              << "x" << tile.mt_n << " wg " << tile.wg_m << "x" << tile.wg_n << (int8 ? " int8 activations, qmode " + std::to_string(qmode) : "") << "\n";
 
-    const std::string src = read_file(dir + "/int2_moe_prefill.cl");
+    const std::string src = read_file(dir + (int8 ? "/int2_moe_prefill_int8.cl" : "/int2_moe_prefill.cl"));
     auto build = [&](const std::string &extra) {
         const char *p = src.c_str();
         cl_program prog = clCreateProgramWithSource(ctx, 1, &p, nullptr, &err);
         CL_CHECK(err);
         const std::string opts = "-cl-std=CL3.0 -I " + dir + " -DTOPK=" + std::to_string(TOPK) + " -DNUM_EXPERTS=" +
-                                 std::to_string(E) + tile.opts() + extra;
+                                 std::to_string(E) + tile.opts() + extra +
+                                 (int8 ? " -DQMODE=" + std::to_string(qmode) + (qmode == 0 ? " -DWRITE_Q" : "") : "");
         err = clBuildProgram(prog, 1, &dev, opts.c_str(), nullptr, nullptr);
         if (err != CL_SUCCESS) {
             size_t len = 0;
@@ -150,9 +156,12 @@ int main(int argc, char **argv) {
         CL_CHECK(err);
         return k;
     };
+    const char *gemm = int8 ? "int2_moe_gemm_mt_i8" : "int2_moe_gemm_mt";
     cl_kernel k_route = kern(p_up, "int2_moe_route"), k_gather = kern(p_up, "int2_moe_gather"),
-              k_up = kern(p_up, "int2_moe_gemm_mt"), k_gate = kern(p_gate, "int2_moe_gemm_mt"),
-              k_down = kern(p_down, "int2_moe_gemm_mt"), k_comb = kern(p_down, "int2_moe_combine");
+              k_up = kern(p_up, gemm), k_gate = kern(p_gate, gemm),
+              k_down = kern(p_down, gemm), k_comb = kern(p_down, "int2_moe_combine");
+    cl_kernel k_q1 = int8 ? kern(p_up, "quant_a") : nullptr, k_q2 = int8 ? kern(p_up, "quant_a") : nullptr;
+    cl_kernel k_gather_q = int8 && qmode == 0 ? kern(p_up, "int2_moe_gather_q") : nullptr;
 
     std::mt19937 rng(42);
     std::vector<Proj> gate(sets, Proj{E, H, I}), up(sets, Proj{E, H, I}), down(sets, Proj{E, I, H});
@@ -199,6 +208,12 @@ int main(int argc, char **argv) {
     cl_mem dMeta = buf((2 * E + 2) * 4), dPerm = buf(G * 4), dInv = buf(G * 4);
     cl_mem dXs = buf((size_t)G * H * 2), dU = buf((size_t)G * I * 2), dH = buf((size_t)G * I * 2),
            dY = buf((size_t)G * H * 4), dO = buf((size_t)T * H * 2);
+    // per-(128-group, row) activation scales, rows padded to 32 as int2_int8_dpas.cl's LDSA
+    const size_t ldsa = (size_t)(G + 31) & ~size_t{31};
+    cl_mem dSA1 = buf(H / kGS * ldsa * 2), dSA2 = buf(I / kGS * ldsa * 2);
+    const size_t ldsa_t = (size_t)(T + 31) & ~size_t{31};
+    cl_mem dXq = buf((size_t)T * H), dSAt = buf(H / kGS * ldsa_t * 2), dXsq = buf((size_t)G * H),
+           dHq = buf((size_t)G * I);
 
     const size_t max_tiles = (size_t)(G + RPT - 1) / RPT + E;
     const size_t wg = 16 * tile.wg_m * tile.wg_n;
@@ -213,9 +228,43 @@ int main(int argc, char **argv) {
     auto run_layer = [&](int l, cl_event *ev) {
         set(k_route, 0, dIds), set(k_route, 1, dMeta), set(k_route, 2, dPerm), set(k_route, 3, dInv), set(k_route, 4, G);
         enq(k_route, {1024, 1}, {1024, 1}, ev ? &ev[0] : nullptr);
+        cl_mem none = dXs;
+        // quant_a(A, SA, Aq, M, K); gemm(meta, A, Aq, SA, B, SB, C, Other, G, N, K)
+        auto quant = [&](cl_kernel k, cl_mem a, cl_mem sa, cl_mem aq, int M, int K, cl_event *e) {
+            set(k, 0, a), set(k, 1, sa), set(k, 2, aq), set(k, 3, M), set(k, 4, K);
+            enq(k, {(size_t)K / kGS * 16, (size_t)M}, {16, 1}, e);
+        };
+        auto gemm8 = [&](cl_kernel k, cl_mem a, cl_mem aq, cl_mem sa, const Proj &p, cl_mem c, cl_mem other, int N, int K,
+                         cl_event *e) {
+            set(k, 0, dMeta), set(k, 1, a), set(k, 2, aq), set(k, 3, sa), set(k, 4, p.dB), set(k, 5, p.dS), set(k, 6, c),
+                set(k, 7, other), set(k, 8, G), set(k, 9, N), set(k, 10, K);
+            enq(k, gemm_global(N), {wg, 1}, e);
+        };
+        if (int8 && qmode == 0) {
+            quant(k_q1, dX, dSAt, dXq, T, H, ev ? &ev[1] : nullptr);
+            set(k_gather_q, 0, dXq), set(k_gather_q, 1, dSAt), set(k_gather_q, 2, dPerm), set(k_gather_q, 3, dXsq),
+                set(k_gather_q, 4, dSA1), set(k_gather_q, 5, T), set(k_gather_q, 6, G), set(k_gather_q, 7, H);
+            enq(k_gather_q, {256, (size_t)G}, {256, 1}, ev ? &ev[2] : nullptr);
+            gemm8(k_up, none, dXsq, dSA1, up[l], dU, none, I, H, ev ? &ev[3] : nullptr);
+            gemm8(k_gate, none, dXsq, dSA1, gate[l], dH, dU, I, H, ev ? &ev[4] : nullptr);
+            quant(k_q2, dH, dSA2, dHq, G, I, ev ? &ev[5] : nullptr);
+            gemm8(k_down, none, dHq, dSA2, down[l], dY, none, H, I, ev ? &ev[6] : nullptr);
+            set(k_comb, 0, dY), set(k_comb, 1, dInv), set(k_comb, 2, dRW), set(k_comb, 3, dO), set(k_comb, 4, H);
+            enq(k_comb, {(size_t)(H + 63) / 64 * 64, (size_t)T}, {64, 1}, ev ? &ev[7] : nullptr);
+            return;
+        }
         set(k_gather, 0, dX), set(k_gather, 1, dPerm), set(k_gather, 2, dXs), set(k_gather, 3, H);
         enq(k_gather, {256, (size_t)G}, {256, 1}, ev ? &ev[1] : nullptr);
-        cl_mem none = dXs;
+        if (int8) {
+            quant(k_q1, dXs, dSA1, none, G, H, ev ? &ev[2] : nullptr);
+            gemm8(k_up, dXs, none, dSA1, up[l], dU, none, I, H, ev ? &ev[3] : nullptr);
+            gemm8(k_gate, dXs, none, dSA1, gate[l], dH, dU, I, H, ev ? &ev[4] : nullptr);
+            quant(k_q2, dH, dSA2, none, G, I, ev ? &ev[5] : nullptr);
+            gemm8(k_down, dH, none, dSA2, down[l], dY, none, H, I, ev ? &ev[6] : nullptr);
+            set(k_comb, 0, dY), set(k_comb, 1, dInv), set(k_comb, 2, dRW), set(k_comb, 3, dO), set(k_comb, 4, H);
+            enq(k_comb, {(size_t)(H + 63) / 64 * 64, (size_t)T}, {64, 1}, ev ? &ev[7] : nullptr);
+            return;
+        }
         // up, then gate with silu(gate) * up
         set(k_up, 0, dMeta), set(k_up, 1, dXs), set(k_up, 2, up[l].dB), set(k_up, 3, up[l].dS), set(k_up, 4, dU),
             set(k_up, 5, none), set(k_up, 6, I), set(k_up, 7, H);
@@ -231,6 +280,11 @@ int main(int argc, char **argv) {
     };
 
     run_layer(0, nullptr);
+    if (!dump_up.empty()) {
+        std::vector<dt16> u((size_t)G * I);
+        CL_CHECK(clEnqueueReadBuffer(q, dU, CL_TRUE, 0, u.size() * 2, u.data(), 0, nullptr, nullptr));
+        std::ofstream(dump_up, std::ios::binary).write((const char *)u.data(), u.size() * 2);
+    }
     std::vector<dt16> O((size_t)T * H);
     CL_CHECK(clEnqueueReadBuffer(q, dO, CL_TRUE, 0, O.size() * 2, O.data(), 0, nullptr, nullptr));
     double max_err = 0.0, max_ref = 0.0;
@@ -261,20 +315,23 @@ int main(int argc, char **argv) {
     }
     const double rel = max_err / std::max(max_ref, 1e-30);
     std::cout << "check (" << std::min(T, check) << " tokens): max_abs_err " << std::scientific << std::setprecision(3)
-              << max_err << " (max |ref| " << max_ref << ", rel " << rel << ") " << (rel < 1e-2 ? "PASS" : "FAIL")
+              << max_err << " (max |ref| " << max_ref << ", rel " << rel << ") " << (rel < (int8 ? 5e-2 : 1e-2) ? "PASS" : "FAIL")
               << std::fixed << "\n";
 
     for (int w = 0; w < 10; ++w)
         for (int l = 0; l < sets; ++l) run_layer(l, nullptr);
     CL_CHECK(clFinish(q));
-    const char *names[6] = {"route", "gather", "up", "gate", "down", "combine"};
-    std::vector<std::vector<double>> t(6);
+    std::vector<const char *> names = {"route", "gather", "up", "gate", "down", "combine"};
+    if (int8) names = {"route", "gather", "quant_x", "up", "gate", "quant_h", "down", "combine"};
+    if (int8 && qmode == 0) names = {"route", "quant_x", "gather_q", "up", "gate", "quant_h", "down", "combine"};
+    const int n_ev = (int)names.size();
+    std::vector<std::vector<double>> t(n_ev);
     for (int it = 0; it < iters; ++it)
         for (int l = 0; l < sets; ++l) {
-            cl_event ev[6];
+            cl_event ev[8];
             run_layer(l, ev);
-            CL_CHECK(clWaitForEvents(6, ev));
-            for (int k = 0; k < 6; ++k) {
+            CL_CHECK(clWaitForEvents(n_ev, ev));
+            for (int k = 0; k < n_ev; ++k) {
                 cl_ulong s0, s1;
                 clGetEventProfilingInfo(ev[k], CL_PROFILING_COMMAND_START, sizeof s0, &s0, nullptr);
                 clGetEventProfilingInfo(ev[k], CL_PROFILING_COMMAND_END, sizeof s1, &s1, nullptr);
@@ -284,7 +341,7 @@ int main(int argc, char **argv) {
         }
     double total = 0.0;
     std::cout << std::setprecision(1);
-    for (int k = 0; k < 6; ++k) {
+    for (int k = 0; k < n_ev; ++k) {
         std::sort(t[k].begin(), t[k].end());
         const double m = t[k][t[k].size() / 2];
         total += m;
