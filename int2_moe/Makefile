@@ -9,10 +9,16 @@ LDFLAGS   = -L$(ONEAPI)/lib -lOpenCL
 BUILD  = build
 TARGET = $(BUILD)/int2_moe_ocl
 
-all: $(TARGET) $(BUILD)/int2_moe.cl $(BUILD)/int2_fp16_upcvt.cl $(BUILD)/epilogue.clh
+all: $(TARGET) $(BUILD)/int2_moe_prefill_ocl $(BUILD)/int2_moe_prefill.cl $(BUILD)/int2_moe.cl $(BUILD)/int2_fp16_upcvt.cl $(BUILD)/epilogue.clh
 
 $(TARGET): main.cpp ../common/dt16.hpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+
+$(BUILD)/int2_moe_prefill_ocl: prefill.cpp ../common/dt16.hpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+
+$(BUILD)/int2_moe_prefill.cl: int2_moe_prefill.cl | $(BUILD)
+	cp $< $@
 
 # the kernels include the unchanged dense int2 source and its epilogue header
 $(BUILD)/int2_moe.cl: int2_moe.cl | $(BUILD)
