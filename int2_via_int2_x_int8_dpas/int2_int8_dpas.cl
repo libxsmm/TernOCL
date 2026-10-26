@@ -27,6 +27,10 @@
 // A quantized A tile is reused for every 16-column DPAS block of the
 // sub-group tile, and B (never converted) for every 8-row block.
 
+// Kernel selection: every kernel in this file is built by default. A host that
+// needs one kernel per program (e.g. OpenVINO's kernels_cache) defines
+// TERNOCL_SELECT_KERNELS and TERNOCL_KERNEL_<NAME> for each kernel it builds.
+
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 typedef ushort dt;  // raw DT bits
@@ -96,6 +100,7 @@ inline short8 quant8x32(uint8 a, float sal) {
 
 // ---------------------------------------------------------------------------
 // Pre-kernel: one sub-group per (row, 128-group). SA always, Aq if WRITE_Q.
+#if !defined(TERNOCL_SELECT_KERNELS) || defined(TERNOCL_KERNEL_QUANT_A)
 __attribute__((intel_reqd_sub_group_size(16)))
 __kernel void quant_a(const __global dt *A, __global dt *SA,
         __global char *Aq, int M, int K) {
@@ -115,6 +120,7 @@ __kernel void quant_a(const __global dt *A, __global dt *SA,
     vstore8(convert_char8_sat_rte(a * TOF(sh)), 0, Aq + off);
 #endif
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // GEMV / small M. A sub-group owns 16 columns and SGM rows and walks its K
@@ -201,6 +207,7 @@ inline fa_t step(fa_t acc, const __private uint *w, float sb,
     return acc;
 }
 
+#if !defined(TERNOCL_SELECT_KERNELS) || defined(TERNOCL_KERNEL_INT2_INT8_GEMV)
 __attribute__((intel_reqd_sub_group_size(16)))
 __attribute__((reqd_work_group_size(16 * NSG_N * LS, 1, 1)))
 __kernel void int2_int8_gemv(const __global dt *A, const __global char *Aq,
@@ -271,6 +278,7 @@ __kernel void int2_int8_gemv(const __global dt *A, const __global char *Aq,
             C[i] = CT_STORE(epi(EL(acc, r), epi_in(Other, Bias, i, n0 + lane)));
         }
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // Large-M GEMM. A sub-group computes an MT_M x MT_N tile (MT_M % 8 == 0,
@@ -302,6 +310,7 @@ inline float load_sa(const __global dt *SA, int M, int K, int m, int s) {
     return TOF(t);
 }
 
+#if !defined(TERNOCL_SELECT_KERNELS) || defined(TERNOCL_KERNEL_INT2_INT8_GEMM_MT)
 __attribute__((intel_reqd_sub_group_size(16)))
 __attribute__((reqd_work_group_size(16 * WG_N * WG_M, 1, 1)))
 __kernel void int2_int8_gemm_mt(const __global dt *A, const __global char *Aq,
@@ -373,3 +382,4 @@ __kernel void int2_int8_gemm_mt(const __global dt *A, const __global char *Aq,
         for (int j = 0; j < NB; ++j)
             epi_store8x16(C, Other, Bias, M, N, m0 + 8 * i, n0 + 16 * j, acc[i][j]);
 }
+#endif

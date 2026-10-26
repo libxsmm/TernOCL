@@ -33,6 +33,10 @@
 //
 // Requires N % 16 == 0 and K % 128 == 0.
 
+// Kernel selection: every kernel in this file is built by default. A host that
+// needs one kernel per program (e.g. OpenVINO's kernels_cache) defines
+// TERNOCL_SELECT_KERNELS and TERNOCL_KERNEL_<NAME> for each kernel it builds.
+
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 #ifdef BF16
@@ -186,6 +190,7 @@ inline acc_t step(acc_t acc, const __private uint *w, uint sc,
     return acc;
 }
 
+#if !defined(TERNOCL_SELECT_KERNELS) || defined(TERNOCL_KERNEL_INT2_FP16_UPCVT_GEMM)
 __attribute__((intel_reqd_sub_group_size(16)))
 __attribute__((reqd_work_group_size(SG_N * NSG_N * LS, 1, 1)))
 __kernel void int2_fp16_upcvt_gemm(const __global dt *A,
@@ -282,6 +287,7 @@ __kernel void int2_fp16_upcvt_gemm(const __global dt *A,
             C[i] = CT_STORE(epi(v, epi_in(Other, Bias, i, n0 + lane)));
         }
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // Large-M GEMM. A sub-group computes an MT_M x MT_N tile (MT_M % 8 == 0,
@@ -329,6 +335,7 @@ __kernel void int2_fp16_upcvt_gemm(const __global dt *A,
 #endif
 #endif
 
+#if !defined(TERNOCL_SELECT_KERNELS) || defined(TERNOCL_KERNEL_INT2_FP16_UPCVT_GEMM_MT)
 __attribute__((intel_reqd_sub_group_size(16)))
 __attribute__((reqd_work_group_size(16 * WG_N * WG_M, 1, 1)))
 __kernel void int2_fp16_upcvt_gemm_mt(const __global dt *A,
@@ -386,3 +393,4 @@ __kernel void int2_fp16_upcvt_gemm_mt(const __global dt *A,
             epi_store8x16(C, Other, Bias, M, N, m0 + 8 * i, n0 + 16 * j, v);
         }
 }
+#endif
