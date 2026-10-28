@@ -60,6 +60,7 @@ inline bool moe_reduce_ls(__local float *red, float *acc, int sgk, int sgn, int 
     return true;
 }
 
+#if !defined(TERNOCL_SELECT_KERNELS) || defined(TERNOCL_KERNEL_INT2_MOE_GATE_UP)
 __attribute__((intel_reqd_sub_group_size(16)))
 __attribute__((reqd_work_group_size(SG_N * NSG_N * LS, 1, 1)))
 __kernel void int2_moe_gate_up(const __global int *ids, const __global dt *X,
@@ -93,7 +94,9 @@ __kernel void int2_moe_gate_up(const __global int *ids, const __global dt *X,
     if (n0 >= N) return;
     H[(size_t)g * N + n0 + lane] = TO_DT(ag * sigmoid_x(ag) * au);
 }
+#endif
 
+#if !defined(TERNOCL_SELECT_KERNELS) || defined(TERNOCL_KERNEL_INT2_MOE_DOWN)
 __attribute__((intel_reqd_sub_group_size(16)))
 __attribute__((reqd_work_group_size(SG_N * NSG_N * LS, 1, 1)))
 __kernel void int2_moe_down(const __global int *ids, const __global dt *H, const __global dt *RW,
@@ -121,7 +124,9 @@ __kernel void int2_moe_down(const __global int *ids, const __global dt *H, const
     if (n0 >= N) return;
     Y[(size_t)g * N + n0 + lane] = acc * TOF(RW[g]);
 }
+#endif
 
+#if !defined(TERNOCL_SELECT_KERNELS) || defined(TERNOCL_KERNEL_INT2_MOE_REDUCE)
 __kernel void int2_moe_reduce(const __global float *Y, __global dt *O, int N) {
     const int n = get_global_id(0);
     const int t = get_global_id(1);
@@ -130,9 +135,11 @@ __kernel void int2_moe_reduce(const __global float *Y, __global dt *O, int N) {
     for (int j = 0; j < TOPK; ++j) s += Y[((size_t)t * TOPK + j) * N + n];
     O[(size_t)t * N + n] = TO_DT(s);
 }
+#endif
 
 // int2_moe_down + int2_moe_reduce in one launch: a work-group owns a column block
 // of one token and walks its TOPK experts, O[t, n] = sum_j rw[g] * (H[g] . down_e[:, n])
+#if !defined(TERNOCL_SELECT_KERNELS) || defined(TERNOCL_KERNEL_INT2_MOE_DOWN_SUM)
 __attribute__((intel_reqd_sub_group_size(16)))
 __attribute__((reqd_work_group_size(SG_N * NSG_N * LS, 1, 1)))
 __kernel void int2_moe_down_sum(const __global int *ids, const __global dt *H, const __global dt *RW,
@@ -164,3 +171,4 @@ __kernel void int2_moe_down_sum(const __global int *ids, const __global dt *H, c
     if (n0 >= N) return;
     O[(size_t)t * N + n0 + lane] = TO_DT(acc);
 }
+#endif

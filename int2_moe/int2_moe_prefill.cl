@@ -26,6 +26,7 @@
 #endif
 #define ROWS_PER_TILE (MT_M * WG_M)
 
+#if !defined(TERNOCL_SELECT_KERNELS) || defined(TERNOCL_KERNEL_INT2_MOE_ROUTE)
 __kernel void int2_moe_route(const __global int *ids, __global int *meta, __global int *perm,
         __global int *inv, int G) {
     __local int cnt[NUM_EXPERTS];
@@ -57,14 +58,18 @@ __kernel void int2_moe_route(const __global int *ids, __global int *meta, __glob
         inv[g] = p;
     }
 }
+#endif
 
+#if !defined(TERNOCL_SELECT_KERNELS) || defined(TERNOCL_KERNEL_INT2_MOE_GATHER)
 __kernel void int2_moe_gather(const __global dt *X, const __global int *perm, __global dt *Xs, int K) {
     const int p = get_global_id(1);
     const __global uint *src = (const __global uint *)(X + (size_t)(perm[p] / TOPK) * K);
     __global uint *dst = (__global uint *)(Xs + (size_t)p * K);
     for (int k = get_global_id(0); k < K / 2; k += get_global_size(0)) dst[k] = src[k];
 }
+#endif
 
+#if !defined(TERNOCL_SELECT_KERNELS) || defined(TERNOCL_KERNEL_INT2_MOE_GEMM_MT)
 __attribute__((intel_reqd_sub_group_size(16)))
 __attribute__((reqd_work_group_size(16 * WG_N * WG_M, 1, 1)))
 __kernel void int2_moe_gemm_mt(const __global int *meta, const __global dt *A_all,
@@ -133,7 +138,9 @@ __kernel void int2_moe_gemm_mt(const __global int *meta, const __global dt *A_al
             epi_store8x16(C, Other, Bias, M, N, m0 + 8 * i, n0 + 16 * j, v);
         }
 }
+#endif
 
+#if !defined(TERNOCL_SELECT_KERNELS) || defined(TERNOCL_KERNEL_INT2_MOE_COMBINE)
 __kernel void int2_moe_combine(const __global float *Y, const __global int *inv, const __global dt *RW,
         __global dt *O, int N) {
     const int n = get_global_id(0);
@@ -146,3 +153,4 @@ __kernel void int2_moe_combine(const __global float *Y, const __global int *inv,
     }
     O[(size_t)t * N + n] = TO_DT(s);
 }
+#endif
