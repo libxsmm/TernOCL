@@ -92,14 +92,23 @@ typedef float8 acc_t;
 #error "SGM must be 1, 2, 4 or 8"
 #endif
 
-#ifdef INT_DQ
+#if defined(INT_DQ) || defined(U2_ZP1)
 // Two consecutive K codes (one nibble of the word, low bits of x) -> one VNNI
 // dword holding the two DT weights, each 0, +scale or -scale (sign = bit 15).
 inline int dq_pair(uint x, uint s2) {
     uint mask = ((uint)(((int)(x << 31)) >> 31) & 0x0000FFFFu)
               | ((uint)(((int)(x << 29)) >> 31) & 0xFFFF0000u);
     uint sign = ((x & 2u) << 14) | ((x & 8u) << 28);
-    return (int)((s2 ^ sign) & mask);
+    const uint value = (s2 ^ sign) & mask;
+#ifdef U2_ZP1
+    // The reserved code 2 represents +2, rather than the signed-int2 value -2.
+    const uint twice = (uint)TO_DT(2.0f * TOF((ushort)s2));
+    const uint low = (x & 3u) == 2u ? twice : value & 0xffffu;
+    const uint high = ((x >> 2) & 3u) == 2u ? twice : value >> 16;
+    return (int)(low | (high << 16));
+#else
+    return (int)value;
+#endif
 }
 
 inline int8 dq_word(uint w, uint s2) {
