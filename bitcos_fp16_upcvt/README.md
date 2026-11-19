@@ -73,6 +73,32 @@ Inner loop per 64 K rows on BMG (offline `ocloc` ISA):
 | OpenCL, `--int-apply` | 211 | 5 | 0 |
 | OpenCL, `--simt-mul` | 369 | 132 | 0 |
 
+## Whole-kernel vISA GEMV ([bitcos_fp16_upcvt_visa.cl](bitcos_fp16_upcvt_visa.cl))
+
+Drop-in replacement for the GEMV kernel (same name and arguments; `--cl build/bitcos_fp16_upcvt_visa.cl --nsg 16 --ls 1`,
+M = 1, no epilogue) whose body is the whole-kernel vISA of
+kernel-generator run `bitcos_visa_ivisa_v50_seq_k16384_n32768` (v50_seq) inlined as two `__asm__` blocks: the LUT store, an OpenCL
+`barrier`, then the K loop and C store. The `.cl` is the only source kept in the tree
+(`make` copies the `.cl` to `build/`). Design: sequential sign layout with one `d32x3` sign load per two 32-row blocks;
+the LUT holds fp16 high-byte codes, so B is widened by byte moves and the scale is applied once per 128-row group on
+the fp32 dpas partial sum. Baked for K = 16384, N = 32768 (other shapes write nothing and fail validation); the
+prefill kernel is the baseline file's, included with its GEMV renamed `_ref`.
+
+Inline-asm notes: the CISA verifier runs on inline asm (the zebin build skipped it), so the dpas A operand is a
+`ud`-typed alias, and `%null` is written `%%null`. The older v45 vISA assumed the interleaved sign layout; adapted to the
+sequential layout it was ~10% slower than the baseline, so v50_seq replaced it.
+
+A/B (Arc Pro B70 on pcl-adl01, M = 1, K = 16384, N = 32768, 3 repeats;
+baseline = `--wgn/--ls` sweep, vISA = `--cl ... --nsg 16 --ls 1`); validates on 2/2 distinct sets:
+
+| z | OpenCL baseline (best config) | inline vISA v50_seq | speed-up |
+| --- | --- | --- | --- |
+| 0.3 | 0.268 ms | 0.244 ms | x1.10 |
+| 0.4 | 0.270 ms | 0.242 ms | x1.12 |
+| 0.5 | 0.261 ms | 0.234 ms | x1.12 |
+
+(The node is slower than the sweep below, so compare only within the table.)
+
 ## Driver ([main.cpp](main.cpp))
 
 ```bash
