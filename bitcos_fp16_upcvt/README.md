@@ -73,6 +73,37 @@ Inner loop per 64 K rows on BMG (offline `ocloc` ISA):
 | OpenCL, `--int-apply` | 211 | 5 | 0 |
 | OpenCL, `--simt-mul` | 369 | 132 | 0 |
 
+## Whole-kernel vISA GEMV ([bitcos_fp16_upcvt_visa.cl](bitcos_fp16_upcvt_visa.cl))
+
+Drop-in replacement for the GEMV kernel (same name and arguments; `--sign-il --nsg 16 --ls 1 --cl
+build/bitcos_fp16_upcvt_visa.cl`, M = 1, no epilogue) whose body is the whole-kernel vISA of kernel-generator run
+`bitcos_visa_ivisa_v45` inlined as two `__asm__` blocks: the LUT store, an OpenCL `barrier`, then the K loop and C
+store. It reads the same sign-interleaved layout as the baseline (`--sign-il`). The `.cl` is the only source kept in
+the tree (`make` copies it to `build/`). Design: the LUT holds fp16 high-byte codes, so B is widened by byte moves and
+the scale is applied once per 128-row group on the fp32 dpas partial sum; the per-block address and sign-window math is
+hand-scheduled. Baked for K = 16384, N = 32768 (other shapes write nothing and fail validation); the prefill kernel is
+the baseline file's, included with its GEMV renamed `_ref`. Inline-asm notes: the CISA verifier runs on inline asm, so
+the dpas A operand is a `ud`-typed alias, and `%null` is written `%%null`.
+
+B70 (pcl-kini01, one of its two B70s; pcl-adl01 / pcl-arl01 agree within about 1%), M = 1, K = 16384, N = 32768, min of
+2-3 runs of 30 iterations. Baseline = this file's GEMV with `--sign-il`, best of `--wgn {32,64,128} --ls {1,2,4}` with
+and without `--opts -DPFD=2`; vISA = `--sign-il --nsg 16 --ls 1 --cl build/bitcos_fp16_upcvt_visa.cl`:
+
+| z | baseline (best config) | vISA | speed-up |
+| --- | --- | --- | --- |
+| 0.1 | 0.239 ms (wgn32/ls2/PFD2) | 0.235 ms | x1.02 |
+| 0.2 | 0.228 ms (wgn128/ls1/PFD2) | 0.222 ms | x1.03 |
+| 0.3 | 0.229 ms (wgn64/ls1/PFD2) | 0.218 ms | x1.05 |
+| 0.4 | 0.231 ms (wgn128/ls1/PFD2) | 0.216 ms | x1.07 |
+| 0.5 | 0.231 ms (wgn32/ls2) | 0.210 ms | x1.10 |
+| 0.6 | 0.228 ms (wgn32/ls2) | 0.208 ms | x1.10 |
+| 0.7 | 0.219 ms (wgn64/ls1/PFD2) | 0.201 ms | x1.09 |
+| 0.8 | 0.211 ms (wgn64/ls1/PFD2) | 0.191 ms | x1.10 |
+| 0.9 | 0.198 ms (wgn64/ls1/PFD2) | 0.182 ms | x1.09 |
+
+Both pass the driver's validation on 3 distinct weight sets; the max ULP difference is of the same size as the
+baseline's (the vISA scales after the fp32 accumulation, like the baseline GEMV).
+
 ## Driver ([main.cpp](main.cpp))
 
 ```bash
