@@ -9,13 +9,16 @@ LDFLAGS   = -L$(ONEAPI)/lib -lOpenCL -fopenmp
 BUILD  = build
 TARGET = $(BUILD)/bitcos_fp16_upcvt_ocl
 
-all: $(TARGET) $(BUILD)/bitcos_fp16_upcvt.cl $(BUILD)/epilogue.clh
+all: $(TARGET) $(BUILD)/bitcos_fp16_upcvt.cl $(BUILD)/bitcos_fp16_upcvt_visa.cl $(BUILD)/epilogue.clh
 
 $(TARGET): main.cpp ../common/dt16.hpp ../common/epilogue.hpp ../common/bitcos.hpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
 # the driver loads the kernel source (and its include) from next to the binary
 $(BUILD)/bitcos_fp16_upcvt.cl: bitcos_fp16_upcvt.cl | $(BUILD)
+	cp $< $@
+
+$(BUILD)/bitcos_fp16_upcvt_visa.cl: bitcos_fp16_upcvt_visa.cl | $(BUILD)
 	cp $< $@
 
 $(BUILD)/epilogue.clh: ../common/epilogue.clh | $(BUILD)
