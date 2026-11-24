@@ -59,9 +59,21 @@ inline void wht8(float *v) {
     }
 }
 
+// -DFWHT_QUANT: also write the int2 x int8 GEMM's activation scales (quant_a, QMODE 1) of the
+// rotated rows, SA[g, m] = DT(127 / absmax over the 128-group g of row m), from the stored DT values.
+#ifdef FWHT_QUANT
+#define GS 128
+#define LDSA(M) (((M) + 31) & ~31)
+#define EPS 1.1920928955078125e-07f
+__attribute__((intel_reqd_sub_group_size(16)))
+#endif
 __attribute__((reqd_work_group_size(WG, 1, 1)))
 __kernel void hadamard_fwht(const __global ushort *x, const __global char *signs,
-        __global ushort *y, int K, int use_signs) {
+        __global ushort *y, int K, int use_signs
+#ifdef FWHT_QUANT
+        , __global ushort *SA, int M
+#endif
+        ) {
     __local float slm[HB];
     const int lid = get_local_id(0);
     const size_t blk = get_group_id(0);
@@ -88,8 +100,13 @@ __kernel void hadamard_fwht(const __global ushort *x, const __global char *signs
         wht8(v);
     }
 
+#ifdef FWHT_QUANT
+#define OUT(i, val) do { const ushort o_ = STORE_DT(val); yb[i] = o_; slm[i] = LOAD_F(&o_, 0); } while (0)
+#else
+#define OUT(i, val) yb[i] = STORE_DT(val)
+#endif
 #if REM == 0
-    for (int j = 0; j < 8; ++j) yb[base + j * s] = STORE_DT(v[j] * SCALE);
+    for (int j = 0; j < 8; ++j) OUT(base + j * s, v[j] * SCALE);
 #else
     for (int j = 0; j < 8; ++j) slm[base + j * s] = v[j];
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -97,19 +114,30 @@ __kernel void hadamard_fwht(const __global ushort *x, const __global char *signs
     for (int j = 0; j < 4; ++j) {
         const int i = lid + j * WG;
         const float a = slm[i], b = slm[i + HB / 2];
-        yb[i] = STORE_DT((a + b) * SCALE);
-        yb[i + HB / 2] = STORE_DT((a - b) * SCALE);
+        OUT(i, (a + b) * SCALE);
+        OUT(i + HB / 2, (a - b) * SCALE);
     }
 #else
     for (int j = 0; j < 2; ++j) {
         const int i = lid + j * WG, q = HB / 4;
         const float a0 = slm[i], a1 = slm[i + q], a2 = slm[i + 2 * q], a3 = slm[i + 3 * q];
         const float t0 = a0 + a1, t1 = a0 - a1, t2 = a2 + a3, t3 = a2 - a3;
-        yb[i] = STORE_DT((t0 + t2) * SCALE);
-        yb[i + q] = STORE_DT((t1 + t3) * SCALE);
-        yb[i + 2 * q] = STORE_DT((t0 - t2) * SCALE);
-        yb[i + 3 * q] = STORE_DT((t1 - t3) * SCALE);
+        OUT(i, (t0 + t2) * SCALE);
+        OUT(i + q, (t1 + t3) * SCALE);
+        OUT(i + 2 * q, (t0 - t2) * SCALE);
+        OUT(i + 3 * q, (t1 - t3) * SCALE);
     }
 #endif
+#endif
+#ifdef FWHT_QUANT
+    // 16 consecutive items (one sub-group) own one contiguous 128-group of the block
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float mx = 0.0f;
+    for (int j = 0; j < 8; ++j) mx = fmax(mx, fabs(slm[lid * 8 + j]));
+    mx = sub_group_reduce_max(mx);
+    if (get_sub_group_local_id() == 0) {
+        const size_t g = (blk % bpr) * (HB / GS) + lid / 16;
+        SA[g * LDSA(M) + blk / bpr] = STORE_DT(127.0f / fmax(mx, EPS));
+    }
 #endif
 }
